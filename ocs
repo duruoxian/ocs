@@ -1,0 +1,1113 @@
+#!/usr/bin/env python3
+"""ocs — opencode 会话选择器（ZCode 风格）。
+
+像 ZCode 一样浏览和管理 opencode 历史会话：按项目分组、模糊搜索（含会话内容）、
+右侧预览、回车继续；支持对话视图（收起/展开 AI 回答）、重命名、批量删除。
+
+═══ 使用教程 ═══════════════════════════════════════════════════════════
+
+【一】打开与浏览
+  ocs                    在终端里打开会话列表（所有项目，按项目分组）
+  打字                   过滤，可搜标题和会话里聊过的内容
+  ↑ / ↓                  上下选择，右侧实时预览详情
+  回车                   继续选中的会话；退出 opencode 后自动回到列表
+  双击                   同样=继续
+  滚轮                   浏览列表
+
+【二】对话视图（看聊天记录）
+  按 →                   打开当前会话的对话视图（列表换成消息列表）
+  ←                      返回会话列表
+  默认状态               只显示你提过的问题（一条一行）
+  点击某条提问 / 按 →    展开这条提问对应的 AI 回答（回答太长会自动折行）
+  再点击 / 再按 →        收起该条 AI 回答
+  右侧预览               显示光标所在那一条的完整问答
+
+【三】复制文字
+  右键一次（或 F8）      把鼠标交给终端，之后：
+                          · 按住拖动   = 选中文字（不用按 Shift）
+                          · 右键       = 直接弹出「复制」菜单
+  按 F8                  切回点击模式（平时：箭头光标、可点会话）
+  ctrl-y                 一键复制当前会话的 ID
+
+【四】会话管理
+  ctrl-r                 重命名会话
+  ctrl-d                 删除：光标在会话=删该条；在项目分组行=删整组；
+                         tab 多选（可 ctrl-a 全选）后按=批量删
+  ctrl-e                 分叉继续（复制一份会话来聊，不影响原会话）
+  tab / ctrl-a           多选 / 全选      esc           退出
+
+【五】命令行
+  ocs -p /path/项目      只看指定项目
+  ocs --last [N]         直接继续最近第 N 个会话
+  ocs --show ID          查看详情（m:<会话ID>:<序号> 看单条消息）
+  ocs --delete ID...     删除会话（支持 id 前缀、多个，删除前确认）
+  ocs -l                 纯文本列表（适合管道/脚本）
+
+依赖: python3、fzf　|　数据: ~/.local/share/opencode/opencode.db
+"""
+import argparse
+import json
+import os
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import unicodedata
+from datetime import datetime
+from urllib.request import pathname2url
+
+TITLE_FALLBACKS = {"", "new session", "new chat", "新会话"}
+
+GRAY, WHITE, RESET = "\x1b[90m", "\x1b[1m\x1b[97m", "\x1b[0m"
+# 官方 Logo 字形（从官方图片逐块提取）：实心块、竖长字形；open 灰 / code 白
+# 每个字母 7 行 × 4 列像素：第 1 行给 d 的上伸，第 7 行给 p 的下伸
+_LOGO_LETTERS = {
+    "o": ("....", "XXXX", "X..X", "X..X", "X..X", "XXXX", "...."),
+    "p": ("....", "XXXX", "X..X", "X..X", "X..X", "XXXX", "X..."),
+    "e": ("....", "XXXX", "X..X", "XXXX", "X...", "XXXX", "...."),
+    "n": ("....", "XXXX", "X..X", "X..X", "X..X", "X..X", "...."),
+    "c": ("....", "XXXX", "X...", "X...", "X...", "XXXX", "...."),
+    "d": ("...X", "XXXX", "X..X", "X..X", "X..X", "XXXX", "...."),
+}
+_LOGO_WORD = "opencode"
+
+
+def logo_lines():
+    """半块字符（▀▄█）渲染：7 行像素网格压缩为 4 个终端行，整体比例与官方图一致。"""
+    grids = [_LOGO_LETTERS[ch] for ch in _LOGO_WORD]
+    lines = []
+    for dr in range(0, 7, 2):
+        segs = []
+        for i, g in enumerate(grids):
+            color = GRAY if i < 4 else WHITE  # open 灰 / code 白
+            s = ""
+            for col in range(4):
+                top = g[dr][col] == "X"
+                bot = dr + 1 < 7 and g[dr + 1][col] == "X"
+                s += "█" if top and bot else "▀" if top else "▄" if bot else " "
+            segs.append(color + s + RESET)
+        lines.append(" ".join(segs))
+    return lines
+
+
+def C(s):   # 蓝色（部分主题会把 cyan 显示成刺眼的绿色，所以统一用 blue）
+    return f"\x1b[34m{s}\x1b[0m"
+
+
+def M(s):   # magenta（AI 回答用）
+    return f"\x1b[35m{s}\x1b[0m"
+
+
+def D(s):   # dim
+    return f"\x1b[2m{s}\x1b[0m"
+
+
+def B(s):   # bold
+    return f"\x1b[1m{s}\x1b[0m"
+
+
+# ---------- 基础工具 ----------
+
+def db_path():
+    cands = []
+    if os.environ.get("OPENCODE_DATA"):
+        cands.append(os.path.join(os.environ["OPENCODE_DATA"], "opencode.db"))
+    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    cands.append(os.path.join(xdg, "opencode", "opencode.db"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    sys.exit("找不到 opencode 数据库，尝试过:\n  " + "\n  ".join(cands))
+
+
+def connect():
+    con = sqlite3.connect("file:" + pathname2url(db_path()) + "?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def dw(s):
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
+
+
+def pad(s, w):
+    return s + " " * max(0, w - dw(s))
+
+
+def trunc(s, n):
+    s = " ".join((s or "").split())
+    return s if dw(s) <= n else s[:n] + "…"
+
+
+def clean_text(t):
+    t = (t or "").strip()
+    if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        try:
+            v = json.loads(t)
+            if isinstance(v, str):
+                t = v
+        except ValueError:
+            pass
+    return t
+
+
+def rel_time(ms):
+    dt = datetime.fromtimestamp(ms / 1000)
+    sec = (datetime.now() - dt).total_seconds()
+    if sec < 60:
+        return "刚刚"
+    if sec < 3600:
+        return f"{int(sec // 60)} 分钟前"
+    if sec < 86400:
+        return f"{int(sec // 3600)} 小时前"
+    if sec < 7 * 86400:
+        return f"{int(sec // 86400)} 天前"
+    if dt.year == datetime.now().year:
+        return dt.strftime("%m-%d %H:%M")
+    return dt.strftime("%Y-%m-%d")
+
+
+def abs_time(ms):
+    return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_tok(n):
+    if n >= 10000:
+        return f"{n / 1000:.0f}k"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def self_path():
+    a0 = sys.argv[0]
+    if os.path.sep in a0:
+        return os.path.abspath(a0)
+    return shutil.which(a0) or os.path.abspath(a0)
+
+
+# ---------- 鼠标归属运行时切换 ----------
+# 终端里鼠标同一时刻只能归一边：程序占用时可点击列表，但拖动/右键归程序。
+# 通过转义序列在运行时切换（Konsole 实时解析，fzf 无感知），
+# 让"拖动选字 + 右键复制菜单"随用随取，无需 Shift。
+MOUSE_OFF = "\033[?1000l\033[?1002l\033[?1006l"  # 鼠标归终端：拖动选字、右键菜单
+MOUSE_ON = "\033[?1000h\033[?1002h\033[?1006h"   # 鼠标归程序：点击列表、双击继续
+
+
+def mouse_state_path():
+    try:
+        tty = os.path.realpath("/dev/tty")
+        return "/tmp/ocs-mouse-" + os.path.basename(tty)
+    except OSError:
+        return "/tmp/ocs-mouse-default"
+
+
+def write_tty(s):
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY)
+        try:
+            os.write(fd, s.encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def cmd_select_mouse():
+    """把鼠标交给终端：拖动即选字、右键即「复制」菜单（不用 Shift）。F8 可切回。"""
+    with open(mouse_state_path(), "w") as f:
+        f.write("select")
+    write_tty(MOUSE_OFF)
+
+
+def cmd_toggle_mouse():
+    """F8：在 点击模式 与 选字模式 之间切换。"""
+    p = mouse_state_path()
+    if os.path.exists(p):
+        os.unlink(p)
+        write_tty(MOUSE_ON)
+    else:
+        cmd_select_mouse()
+
+
+# ---------- 对话视图（默认只显示用户提问，点击展开/折叠 AI 回答） ----------
+
+def ui_state_path():
+    try:
+        tty = os.path.realpath("/dev/tty")
+        return "/tmp/ocs-ui-" + os.path.basename(tty)
+    except OSError:
+        return "/tmp/ocs-ui-default"
+
+
+def ui_state():
+    try:
+        with open(ui_state_path()) as f:
+            st = json.load(f)
+            if isinstance(st, dict):
+                return st
+    except (OSError, ValueError):
+        pass
+    return {"view": "list"}
+
+
+def ui_state_set(st):
+    try:
+        with open(ui_state_path(), "w") as f:
+            json.dump(st, f)
+    except OSError:
+        pass
+
+
+def ui_state_clear():
+    try:
+        os.unlink(ui_state_path())
+    except OSError:
+        pass
+
+
+def parse_msg_id(mid):
+    """消息行 id 形如 m:<session_id>:<序号>；不是消息行返回 None。"""
+    if not mid.startswith("m:"):
+        return None
+    parts = mid.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        return None
+    return parts[1], int(parts[2])
+
+
+def toggle_msg(mid):
+    """点击/展开某条消息：切换其 AI 回答的显示状态。"""
+    pm = parse_msg_id(mid)
+    if not pm:
+        return
+    sid, idx = pm
+    st = ui_state()
+    if st.get("view") != "msg" or st.get("sid") != sid:
+        return
+    exp = set(st.get("expanded", []))
+    exp.symmetric_difference_update({idx})
+    st["expanded"] = sorted(exp)
+    ui_state_set(st)
+
+
+def cmd_nav_right(mid):
+    """→：会话行=打开对话视图；消息行=展开/折叠 AI 回答。"""
+    pm = parse_msg_id(mid)
+    if pm:
+        toggle_msg(mid)
+        return
+    if mid.startswith("ses"):
+        ui_state_set({"view": "msg", "sid": mid, "expanded": []})
+
+
+def cmd_nav_left(mid):
+    """←：返回会话列表。"""
+    ui_state_set({"view": "list"})
+
+
+def cmd_click(mid):
+    """单击：返回行=回到列表；消息行=展开/折叠；其他行不做任何事。"""
+    if mid == "@back":
+        return cmd_nav_left(mid)
+    toggle_msg(mid)
+
+
+def message_pairs(con, sid):
+    """按时间正序返回 [(用户消息, 紧随其后的 AI 回复文本或 "")]。"""
+    rows = con.execute(
+        "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, id",
+        (sid,),
+    ).fetchall()
+    pairs, cur = [], None
+    for mid, mdata in rows:
+        try:
+            role = json.loads(mdata).get("role")
+        except ValueError:
+            role = None
+        texts = []
+        for (d,) in con.execute(
+            """SELECT data FROM part WHERE message_id = ?
+               AND json_extract(data, '$.type') = 'text' ORDER BY id""",
+            (mid,),
+        ):
+            try:
+                t = clean_text(json.loads(d).get("text", ""))
+            except ValueError:
+                t = ""
+            if t:
+                texts.append(t)
+        body = " ".join(" ".join(texts).split())
+        if role == "user":
+            if cur:
+                pairs.append(cur)
+            cur = [body, ""]
+        elif role == "assistant" and cur is not None:
+            cur[1] = (cur[1] + " " + body).strip() if cur[1] else body
+    if cur:
+        pairs.append(cur)
+    return pairs
+
+
+# ---------- 数据库查询 ----------
+
+SQL = """
+SELECT s.id, s.title, s.directory, s.time_created, s.time_updated,
+       s.cost, s.tokens_input, s.tokens_output, s.tokens_reasoning,
+       s.model, s.agent, s.summary_additions, s.summary_deletions, s.summary_files,
+       p.id AS pid, p.name AS pname, p.worktree AS worktree
+FROM session s LEFT JOIN project p ON p.id = s.project_id
+WHERE s.parent_id IS NULL AND s.time_archived IS NULL
+"""
+
+
+def find_row(con, sid):
+    r = con.execute(SQL + " AND s.id = ?", (sid,)).fetchone()
+    if r:
+        return r
+    if len(sid) >= 6:  # 允许传 id 前缀，只要能唯一匹配
+        rows = con.execute(SQL + " AND s.id LIKE ? || '%'", (sid,)).fetchall()
+        if len(rows) == 1:
+            return rows[0]
+        if len(rows) > 1:
+            sys.exit("前缀 %r 匹配到多个会话，请用更长的 id:\n  "
+                     % sid + "\n  ".join(x["id"] for x in rows))
+    return None
+
+
+def group_of(r):
+    """分组键：真实项目按项目分组；挂在 '/' 下的会话按实际运行目录分组。"""
+    wt = r.get("worktree") or ""
+    if wt and wt != "/" and r.get("pid"):
+        return ("p:" + r["pid"], r.get("pname") or proj_label(r), wt)
+    d = r.get("directory") or wt or "?"
+    return ("d:" + d, os.path.basename(d.rstrip("/")) or d, d)
+
+
+def load_sessions(con, pid):
+    sql, params = SQL, []
+    if pid:
+        sql += " AND s.project_id = ?"
+        params.append(pid)
+    rows = [dict(r) for r in con.execute(sql, params)]
+    counts = dict(con.execute("SELECT session_id, COUNT(*) FROM message GROUP BY session_id"))
+    for r in rows:
+        r["msgs"] = counts.get(r["id"], 0)
+        ensure_title(con, r)
+        r["gkey"], r["glabel"], r["gpath"] = group_of(r)
+    rows.sort(key=lambda r: r["time_updated"], reverse=True)
+    return rows
+
+
+def ensure_title(con, r):
+    t = (r["title"] or "").strip()
+    if t.lower() in TITLE_FALLBACKS:
+        t = ""
+    if not t:
+        texts = first_user_texts(con, r["id"], 1)
+        t = trunc(texts[0], 30) if texts else "(无标题)"
+    r["title"] = t
+
+
+def first_user_texts(con, sid, limit=None):
+    """用户消息文本，时间正序。limit=None 取全部。"""
+    sql = """SELECT p2.data FROM message m JOIN part p2 ON p2.message_id = m.id
+             WHERE m.session_id = ? AND json_extract(m.data, '$.role') = 'user'
+               AND json_extract(p2.data, '$.type') = 'text'
+             ORDER BY m.time_created, p2.id"""
+    params = [sid]
+    if limit:
+        sql += " LIMIT ?"
+        params.append(limit)
+    out = []
+    for r in con.execute(sql, params):
+        try:
+            t = clean_text(json.loads(r[0]).get("text", ""))
+        except ValueError:
+            t = ""
+        if t:
+            out.append(t)
+    return out
+
+
+def last_assistant_text(con, sid):
+    row = con.execute(
+        """SELECT id FROM message
+           WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant'
+           ORDER BY time_created DESC, id DESC LIMIT 1""",
+        (sid,),
+    ).fetchone()
+    if not row:
+        return ""
+    texts = []
+    for (d,) in con.execute(
+        """SELECT data FROM part WHERE message_id = ?
+           AND json_extract(data, '$.type') = 'text' ORDER BY id""",
+        (row[0],),
+    ):
+        try:
+            t = clean_text(json.loads(d).get("text", ""))
+        except ValueError:
+            t = ""
+        if t:
+            texts.append(t)
+    return "\n".join(texts)
+
+
+def search_text(con, r):
+    """会话内容摘要：用于 fzf 全文搜索（隐藏字段）。"""
+    parts = first_user_texts(con, r["id"], 2)
+    reply = last_assistant_text(con, r["id"])
+    if reply:
+        parts.append(reply)
+    return " ".join(" ".join(parts).split())[:400]
+
+
+def model_of(con, r):
+    m = r.get("model")
+    if m:
+        if m.startswith("{"):  # session.model 存的是 JSON 对象
+            try:
+                mm = json.loads(m)
+                return f"{mm.get('providerID', '?')}/{mm.get('id') or mm.get('modelID', '?')}"
+            except ValueError:
+                pass
+        return m
+    q = con.execute(
+        """SELECT data FROM message WHERE session_id = ?
+           AND json_extract(data, '$.model') IS NOT NULL
+           ORDER BY time_created LIMIT 1""",
+        (r["id"],),
+    ).fetchone()
+    if q:
+        try:
+            mm = json.loads(q[0])["model"]
+            return f"{mm.get('providerID', '?')}/{mm.get('modelID', '?')}"
+        except (ValueError, KeyError):
+            pass
+    return "—"
+
+
+def proj_label(r):
+    if r.get("pname"):
+        return r["pname"]
+    wt = r.get("worktree") or ""
+    if wt == "/":
+        return "/"
+    return os.path.basename(wt.rstrip("/")) or wt or "?"
+
+
+def project_dirs(con, pid):
+    ds = set()
+    prow = con.execute("SELECT worktree FROM project WHERE id = ?", (pid,)).fetchone()
+    if prow and prow[0]:
+        ds.add(prow[0])
+    for (d,) in con.execute("SELECT directory FROM project_directory WHERE project_id = ?", (pid,)):
+        ds.add(d)
+    return {d for d in ds if d}
+
+
+def dir_match(d, target):
+    d = d.rstrip("/") or "/"
+    return target == d or target.startswith(d.rstrip("/") + "/")
+
+
+def resolve_project(con, target):
+    target = os.path.abspath(os.path.expanduser(target))
+    projects = con.execute("SELECT id, worktree, name FROM project").fetchall()
+    for r in projects:
+        if r["worktree"] and os.path.abspath(r["worktree"]) == target:
+            return r["id"]
+    for r in projects:
+        if any(dir_match(d, target) for d in project_dirs(con, r["id"])):
+            return r["id"]
+    sys.exit(
+        f"没有找到与 {target} 关联的项目。已知项目:\n"
+        + "\n".join(f"  {r['worktree']}  {r['name'] or ''}" for r in projects)
+    )
+
+
+# ---------- 展示 ----------
+
+def stats(r):
+    seg = [f"{r['msgs']} 条消息"]
+    tot = (r["tokens_input"] or 0) + (r["tokens_output"] or 0) + (r["tokens_reasoning"] or 0)
+    if tot:
+        seg.append(f"{fmt_tok(tot)} tokens")
+    c = r["cost"] or 0
+    if c:
+        seg.append("$" + f"{c:.4f}".rstrip("0").rstrip("."))
+    return " · ".join(seg)
+
+
+def term_cols():
+    """终端真实列数：优先问 /dev/tty（reload 等子进程的 stdout 是管道，量不到）。"""
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+        try:
+            return os.get_terminal_size(fd).columns
+        finally:
+            os.close(fd)
+    except OSError:
+        return shutil.get_terminal_size((120, 24)).columns
+
+
+def row_title_width():
+    """列表行标题列宽：fzf 右侧预览约占一半，标题宽度自适应终端，保证不折行。"""
+    cols = term_cols()
+    pane = max(36, cols // 2 - 5)
+    return max(16, pane - 16)
+
+
+def fzf_line(r, tw, indent=""):
+    """格式: 显示列 \\t 会话id \\t 内容搜索文本（后两列隐藏，只参与搜索/预览取值）"""
+    disp = indent + B(pad(trunc(r["title"], tw), tw + 1))
+    disp += "  " + D(pad(rel_time(r["time_updated"]), 10))
+    return disp + "\t" + r["id"] + "\t" + r.get("search", "")
+
+
+def print_history(con, sid):
+    """会话预览里的历史消息：默认只显示用户提问，AI 回答在对话视图里点开。"""
+    pairs = message_pairs(con, sid)
+    print(f"\n{C('── 我提过的问题 ' + '─' * 20)}")
+    if not pairs:
+        print(D("（没有文本消息）"))
+        return
+    for q, _ in pairs:
+        print(C("•") + " " + trunc(q, 96))
+    if any(a for _, a in pairs):
+        print(D("（按 → 打开对话视图，点消息行可展开/收起 AI 回答）"))
+
+
+def print_message_detail(con, mid):
+    """对话视图里某条消息的详情：完整显示提问与对应的 AI 回答。"""
+    pm = parse_msg_id(mid)
+    if not pm:
+        return
+    sid, idx = pm
+    pairs = message_pairs(con, sid)
+    if idx >= len(pairs):
+        print(D("（消息不存在）"))
+        return
+    q, a = pairs[idx]
+    print(B(f"第 {idx + 1} / {len(pairs)} 条"))
+    print(f"\n{C('提问│')}{q}")
+    print(f"\n{M('AI │')}" + (a if a else D("（没有文本回答）")))
+
+
+def show_detail(con, sid):
+    if parse_msg_id(sid):  # 消息行：显示该条完整问答
+        return print_message_detail(con, sid)
+    if sid == "@back":
+        print(D("← 返回会话列表（按 ← 键，或点击本行）"))
+        return
+    if sid.startswith("@ses:"):
+        sid = sid[5:]
+    elif sid.startswith("@"):  # 分组行：显示项目/目录汇总
+        return show_group_preview(con, sid[1:])
+    row = find_row(con, sid)
+    if not row:
+        sys.exit(f"找不到会话: {sid}")
+    r = dict(row)
+    r["msgs"] = con.execute(
+        "SELECT COUNT(*) FROM message WHERE session_id = ?", (r["id"],)
+    ).fetchone()[0]
+    ensure_title(con, r)
+    ti, to, tr = r["tokens_input"] or 0, r["tokens_output"] or 0, r["tokens_reasoning"] or 0
+    c = r["cost"] or 0
+    print(B(r["title"]))
+    print(f"{D('会话')}   {r['id']}")
+    loc = f"{proj_label(r)}  {D(r['worktree'] or '?')}"
+    if r["directory"] and r["directory"] != r["worktree"]:
+        loc += f"   {D('运行于 ' + r['directory'])}"
+    print(f"{D('项目')}   {loc}")
+    print(f"{D('模型')}   {model_of(con, r)}")
+    print(f"{D('活跃')}   {abs_time(r['time_updated'])} {D('(' + rel_time(r['time_updated']) + ')')}"
+          f"   {D('创建 ' + abs_time(r['time_created']))}")
+    seg = f"{r['msgs']} 条消息 · 输入 {fmt_tok(ti)} tokens · 输出 {fmt_tok(to)} tokens"
+    if tr:
+        seg += f" · 推理 {fmt_tok(tr)} tokens"
+    if c:
+        seg += f" · 费用 ${c:.4f}"
+    print(f"{D('统计')}   {seg}")
+    if r["summary_files"]:
+        print(f"{D('变更')}   +{r['summary_additions'] or 0} -{r['summary_deletions'] or 0}"
+              f" · {r['summary_files']} 文件")
+    print_history(con, r["id"])
+    print(f"\n{D('继续: ocs  |  opencode --session ' + r['id'])}")
+
+
+def show_group_preview(con, key):
+    """分组行预览：key 为 p:<项目id> 或 d:<运行目录>。"""
+    if key.startswith("p:"):
+        prow = con.execute(
+            "SELECT id, worktree, name FROM project WHERE id = ?", (key[2:],)
+        ).fetchone()
+        if not prow:
+            print(D("（未知项目）"))
+            return
+        rows = load_sessions(con, prow["id"])
+        label = prow["name"] or os.path.basename((prow["worktree"] or "?").rstrip("/")) or prow["worktree"]
+        path = prow["worktree"] or "?"
+    else:
+        d = key[2:]
+        rows = [r for r in load_sessions(con, None) if (r.get("directory") or "") == d]
+        label = os.path.basename(d.rstrip("/")) or d
+        path = d
+    print(B(C("◆ " + label)))
+    print(f"{D('路径')}   {path}")
+    if not rows:
+        print(D("（没有会话）"))
+        return
+    tot = sum((x["tokens_input"] or 0) + (x["tokens_output"] or 0) + (x["tokens_reasoning"] or 0)
+              for x in rows)
+    cost = sum(x["cost"] or 0 for x in rows)
+    print(f"{D('会话')}   {len(rows)} 个 · 最近活跃 {rel_time(rows[0]['time_updated'])}")
+    seg = f"共 {fmt_tok(tot)} tokens"
+    if cost:
+        seg += f" · 共 ${cost:.4f}"
+    print(f"{D('统计')}   {seg}")
+    print(f"{D('最新')}   {trunc(rows[0]['title'], 40)}")
+
+
+def print_list(rows):
+    cur = object()
+    for r in rows:
+        if r["gkey"] != cur:
+            cur = r["gkey"]
+            n = sum(1 for x in rows if x["gkey"] == r["gkey"])
+            print(f"\n{B(C('◆ ' + r['glabel']))} {D('— ' + r['gpath'] + f' · {n} 个会话')}")
+        line = "  " + B(pad(trunc(r["title"], 42), 44))
+        line += "  " + D(pad(rel_time(r["time_updated"]), 10))
+        line += "  " + D(f"{stats(r)}  {r['id'][:20]}…")
+        print(line)
+    print(f"\n{D(f'共 {len(rows)} 个会话')}")
+
+
+# ---------- 动作 ----------
+
+def run_resume(row, fork, dry):
+    """启动 opencode 续接会话。dry=True 只打印命令。返回退出码。"""
+    d = ""
+    for cand in (row.get("directory"), row.get("worktree")):
+        if cand and os.path.isdir(cand):
+            d = cand
+            break
+    args = ["opencode", "--session", row["id"]]
+    if fork:
+        args.append("--fork")
+    if dry:
+        print((f"cd {shlex.quote(d)} && " if d else "") + shlex.join(args))
+        return 0
+    t = trunc(row["title"], 50)
+    print(D(f"▸ 继续会话: {t} ({rel_time(row['time_updated'])}) — opencode 退出后回到列表"))
+    return subprocess.run(args, cwd=d or None).returncode
+
+
+def delete_sessions(targets):
+    """删除会话列表（每项需含 id/title），已含确认。返回成功数。"""
+    print("将删除:")
+    for r in targets[:8]:
+        print("  " + trunc(r["title"], 44) + D("  " + r["id"]))
+    if len(targets) > 8:
+        print(D(f"  … 共 {len(targets)} 个"))
+    try:
+        ans = input(f"确认删除 {len(targets)} 个会话? [y/N] ").strip().lower()
+    except (EOFError, OSError):
+        return 0
+    if ans not in ("y", "yes"):
+        print("已取消")
+        return 0
+    ok = 0
+    for r in targets:
+        rc = subprocess.run(["opencode", "session", "delete", r["id"]]).returncode
+        ok += rc == 0
+        print(("✓ 已删除 " if rc == 0 else "✗ 删除失败 ") + r["id"])
+    return ok
+
+
+def copy_to_clipboard(text):
+    """写入系统剪贴板：wl-copy (Wayland) → xclip/xsel (X11) → OSC 52 终端转义。"""
+    try:
+        # wl-copy 会常驻后台提供剪贴板服务，不能等待其退出
+        p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        p.stdin.write(text.encode())
+        p.stdin.close()
+        return True
+    except (FileNotFoundError, OSError):
+        pass
+    for cmd in (["xclip", "-selection", "clipboard"], ["xsel", "-b"]):
+        try:
+            if subprocess.run(cmd, input=text, text=True, capture_output=True,
+                              timeout=5).returncode == 0:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    try:
+        import base64
+        sys.stdout.write("\033]52;c;" + base64.b64encode(text.encode()).decode() + "\07")
+        sys.stdout.flush()
+    except Exception:
+        pass
+    return False
+
+
+def rename_session(row):
+    """重命名会话：直接更新 opencode 数据库中的标题。"""
+    try:
+        import readline  # noqa: F401  让输入支持方向键/编辑
+    except ImportError:
+        pass
+    try:
+        new = input(f"新标题（回车确认，留空取消）[{row['title']}]: ").strip()
+    except (EOFError, OSError):
+        return
+    if not new or new == row["title"]:
+        return
+    con2 = sqlite3.connect(db_path())
+    try:
+        con2.execute("UPDATE session SET title = ? WHERE id = ?", (new, row["id"]))
+        con2.commit()
+    finally:
+        con2.close()
+    row["title"] = new
+
+
+def build_msg_items(con, sid):
+    """对话视图的列表行：标题行 + 返回行 + 用户提问行（展开状态下附带 AI 回答行）。"""
+    row = find_row(con, sid)
+    if not row:
+        return None
+    r = dict(row)
+    ensure_title(con, r)
+    st = ui_state()
+    expanded = set(st.get("expanded", [])) if st.get("sid") == sid else set()
+    items = []
+    items.append((B("◆ " + trunc(r["title"], 60)) + "\t@ses:" + sid + "\t", None))
+    items.append((D("← 返回会话列表") + "\t@back\t", None))
+    pairs = message_pairs(con, sid)
+    for i, (q, a) in enumerate(pairs):
+        mid = f"m:{sid}:{i}"
+        disp = C("提问│") + trunc(q, 160)
+        items.append((disp + "\t" + mid + "\t" + q + " " + a, None))
+        if i in expanded:
+            body = a if a else "（没有文本回答）"
+            items.append((M("AI │") + body + "\t" + mid + "\t" + a, None))
+    return items
+
+
+def build_fzf_items(con, pid):
+    """按当前视图构造 fzf 列表行。返回 (items, 会话总数)。"""
+    st = ui_state()
+    if st.get("view") == "msg" and st.get("sid"):
+        mitems = build_msg_items(con, st["sid"])
+        if mitems is not None:
+            return mitems, len(load_sessions(con, pid))
+        ui_state_clear()  # 会话没了：回列表
+    rows = load_sessions(con, pid)
+    for r in rows:
+        r["search"] = search_text(con, r)
+    items = []
+    tw = row_title_width()
+    if pid is not None:  # -p 指定单项目：不加分组头
+        items += [(fzf_line(r, tw), r) for r in rows]
+    else:
+        groups = {}
+        for r in rows:  # rows 已按时间倒序 → 分组按最近活动排序，组内按时间倒序
+            groups.setdefault(r["gkey"], []).append(r)
+        pane = max(36, term_cols() // 2 - 5)  # 与列表窗格等宽，标题行不折行
+        for gkey, group in groups.items():
+            first = group[0]
+            name = trunc(first["glabel"], 16)
+            tail = f" · {len(group)} 个会话"
+            budget = max(8, pane - 5 - dw(name) - dw(tail))
+            head = (B(C("◆ " + name)) + "  "
+                    + D(trunc(first["gpath"], budget) + tail))
+            items.append((head + "\t@" + gkey + "\t", None))
+            items += [(fzf_line(r, tw, indent="  "), r) for r in group]
+    return items, len(rows)
+
+
+def picker(con, pid, dry):
+    script = self_path()
+    try:
+        os.unlink(mouse_state_path())  # 新会话从点击模式开始
+    except OSError:
+        pass
+    ui_state_clear()  # 新会话从会话列表开始
+    if dry:  # 调试：转储列表行
+        for l, _ in build_fzf_items(con, pid)[0]:
+            print(repr(l))
+        return
+    items, nrows = build_fzf_items(con, pid)
+    if not items:
+        print("（没有会话了）")
+        return
+    if pid:
+        prow = con.execute("SELECT name, worktree FROM project WHERE id = ?", (pid,)).fetchone()
+        label = "◆ " + (prow["name"] or proj_label({"pname": None, "worktree": prow["worktree"]})) if prow else "◆ 项目"
+    else:
+        label = "◆ 全部项目"
+    header = (
+        "\n".join(logo_lines())
+        + f"\n{label} · {nrows} 个会话\n"
+        + D("浏览: 打字过滤（含聊天内容） · ↑↓ 选择 · 回车 继续")
+        + "\n" + D("视图: → 对话视图 · ← 返回 · 点击消息行 = 展开/收起 AI 回答")
+        + "\n" + D("管理: ctrl-r 重命名 · ctrl-d 删除（组头=整组 · tab 多选） · esc 退出")
+        + "\n" + D("复制: 右键/F8 交鼠标给终端 → 拖动选中 · 右键「复制」; F8 切回")
+    )
+    # 所有操作通过 execute 在界面内完成，reload 刷新列表；esc 才退出
+    reload_cmd = shlex.quote(script) + " --fzf-lines" + (f" --pid {shlex.quote(pid)}" if pid else "")
+    cmd = [
+        "fzf", "--ansi", "--layout=reverse", "--multi", "--marker=✓", "--wrap=word", "--track",
+        "--delimiter=\t", "--with-nth=1",
+        f"--preview={shlex.quote(script)} --show '{{2}}'",
+        "--preview-window=right:50%:wrap:border-left",
+        "--prompt=会话❯ ", "--info=inline",
+        f"--header={header}",
+        "--color=prompt:blue,pointer:blue,header:dim",
+        "--height=100%",
+        f"--bind=enter:execute({shlex.quote(script)} --resume {{2}})+reload({reload_cmd})",
+        f"--bind=ctrl-e:execute({shlex.quote(script)} --fork --resume {{2}})+reload({reload_cmd})",
+        f"--bind=ctrl-y:execute-silent({shlex.quote(script)} --copy {{2}})",
+        f"--bind=ctrl-r:execute({shlex.quote(script)} --rename {{2}})+reload({reload_cmd})",
+        f"--bind=ctrl-d:execute({shlex.quote(script)} --dels {{+2}})+reload({reload_cmd})",
+        f"--bind=double-click:execute({shlex.quote(script)} --resume {{2}})+reload({reload_cmd})",
+        # 对话视图：→ 打开/展开 · ← 返回 · 单击消息行=展开/收起 AI 回答
+        f"--bind=right:execute-silent({shlex.quote(script)} --nav-right {{2}})+reload({reload_cmd})",
+        f"--bind=left:execute-silent({shlex.quote(script)} --nav-left {{2}})+reload({reload_cmd})",
+        f"--bind=left-click:execute-silent({shlex.quote(script)} --click {{2}})+reload({reload_cmd})",
+        # 右键 = 把鼠标交给终端（随后：拖动选字、右键「复制」菜单）；F8 切回点击模式
+        f"--bind=right-click:execute-silent({shlex.quote(script)} --select-mouse)",
+        f"--bind=F8:execute-silent({shlex.quote(script)} --toggle-mouse)",
+        # Ctrl+C 交给终端（选中文字时复制）；在 ocs 内不响应，避免误退出
+        "--bind=ctrl-c:ignore",
+    ]
+    try:
+        subprocess.run(cmd, input="\n".join(l for l, _ in items), text=True)
+    except FileNotFoundError:
+        sys.exit("需要 fzf：请先安装（pacman -S fzf），或改用 ocs -l 列表模式")
+
+
+def cmd_resume(ids, fork):
+    """续接会话（fzf execute 调用）：在会话目录里启动 opencode。"""
+    sid = ids[0] if ids else ""
+    if not sid:
+        return
+    if sid.startswith("@ses:"):
+        sid = sid[5:]  # 对话视图的标题行：续接该会话
+    elif sid.startswith("@"):
+        return  # 分组/返回行：忽略
+    pm = parse_msg_id(sid)
+    if pm:
+        sid = pm[0]  # 消息行：续接它所属的会话
+    con = connect()
+    row = find_row(con, sid)
+    if not row:
+        sys.exit(f"找不到会话: {sid}")
+    d = ""
+    for cand in (row["directory"], row["worktree"]):
+        if cand and os.path.isdir(cand):
+            d = cand
+            break
+    args = ["opencode", "--session", row["id"]]
+    if fork:
+        args.append("--fork")
+    if d:
+        os.chdir(d)
+    os.execvp("opencode", args)
+
+
+def cmd_copy(sid):
+    if not sid or sid.startswith("@"):
+        return
+    pm = parse_msg_id(sid)
+    if pm:
+        sid = pm[0]  # 消息行：复制所属会话的 ID
+    con = connect()
+    row = find_row(con, sid)
+    if row:
+        copy_to_clipboard(row["id"])
+        import time
+        time.sleep(0.1)  # 等 wl-copy 完成剪贴板登记，避免 ocs 退出太快丢失
+
+
+def cmd_del(tokens):
+    """删除处理：ses_* 为会话；@ 开头为分组（= 该组全部会话）。"""
+    con = connect()
+    targets = {}
+    for t in tokens:
+        if t.startswith("@"):
+            key = t[1:]
+            for r in load_sessions(con, None):
+                if r["gkey"] == key:
+                    targets[r["id"]] = r
+        elif t.startswith("ses"):
+            row = find_row(con, t)
+            if row:
+                targets[row["id"]] = dict(row)
+        # 其他碎片（路径含空格被拆开等）忽略
+    if not targets:
+        return
+    ordered = sorted(targets.values(), key=lambda r: -r["time_updated"])
+    delete_sessions(ordered)
+
+
+def cmd_fzf_lines(pid):
+    con = connect()
+    for l, _ in build_fzf_items(con, pid)[0]:
+        print(l)
+
+
+# ---------- 入口 ----------
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ocs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="opencode 会话选择器（ZCode 风格）：按项目分组浏览历史会话，"
+                    "回车切回、可重命名、可批量删除。",
+        epilog="""\
+使用教程:
+  【打开与浏览】
+    ocs              打开会话列表（所有项目，按项目分组）
+    打字             过滤，可搜标题和会话里聊过的内容
+    ↑ / ↓            上下选择，右侧实时预览详情
+    回车 / 双击      继续选中的会话；退出 opencode 后自动回到列表
+    滚轮             浏览列表
+
+  【对话视图（看聊天记录）】
+    →                打开当前会话的对话视图（默认只显示你提过的问题）
+    点击某条提问     展开它的 AI 回答；再点一次收起（→ 键同效）
+    ←                返回会话列表
+    右侧预览         显示光标所在那一条的完整问答
+
+  【复制文字】
+    右键一次 / F8    把鼠标交给终端：按住拖动=选中文字，右键=「复制」菜单
+                     （都不用按 Shift）；再按 F8 切回点击模式
+    ctrl-y           一键复制当前会话 ID
+
+  【会话管理】
+    ctrl-r 重命名 · ctrl-e 分叉 · ctrl-d 删除（组头=删整组，tab 多选=批量删）
+    tab 多选 · ctrl-a 全选 · esc 退出
+
+  【命令行】
+    ocs -p /path/项目       只看指定项目
+    ocs --last [N]          直接继续最近第 N 个会话
+    ocs --show ID           查看详情（m:<会话ID>:<序号> 看单条消息）
+    ocs --delete ID...      删除会话（支持 id 前缀、多个，删除前确认）
+    ocs -l                  纯文本列表（适合管道/脚本）
+""",
+    )
+    ap.add_argument("-a", "--all", action="store_true",
+                    help="（默认即是全部项目分组，此参数为兼容保留）")
+    ap.add_argument("-p", "--project", metavar="DIR", help="只看指定项目目录的会话")
+    ap.add_argument("-l", "--list", action="store_true",
+                    help="列表模式输出（非交互，适合管道）")
+    ap.add_argument("--last", nargs="?", const=1, type=int, metavar="N",
+                    help="直接继续全局最近第 N 个会话（默认 1）")
+    ap.add_argument("--show", metavar="SESSION_ID", help="显示某个会话的详情（可用 id 前缀）")
+    ap.add_argument("--delete", nargs="+", metavar="SESSION_ID",
+                    help="删除会话（支持 id 前缀，可一次多个，删除前确认）")
+    ap.add_argument("--fork", action="store_true", help="继续会话时使用 --fork 分叉")
+    ap.add_argument("--select-mouse", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--toggle-mouse", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--nav-right", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--nav-left", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--click", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--print-cmd", action="store_true",
+                    help="调试：--last 时打印命令；选择器模式转储列表行")
+    # —— 以下为 fzf 绑定调用的内部命令 ——
+    ap.add_argument("--resume", nargs="+", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--copy", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--rename", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--dels", nargs="+", metavar="TOKEN", help=argparse.SUPPRESS)
+    ap.add_argument("--fzf-lines", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--pid", metavar="PROJECT_ID", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    con = connect()
+
+    if args.show:
+        show_detail(con, args.show)
+        return
+
+    if args.select_mouse:
+        cmd_select_mouse()
+        return
+
+    if args.toggle_mouse:
+        cmd_toggle_mouse()
+        return
+
+    if args.nav_right is not None:
+        cmd_nav_right(args.nav_right)
+        return
+
+    if args.nav_left is not None:
+        cmd_nav_left(args.nav_left)
+        return
+
+    if args.click is not None:
+        cmd_click(args.click)
+        return
+
+    if args.resume is not None:
+        cmd_resume(args.resume, fork=args.fork)
+        return
+
+    if args.copy:
+        cmd_copy(args.copy)
+        return
+
+    if args.rename:
+        if not args.rename.startswith("@"):
+            row = find_row(con, args.rename)
+            if row:
+                rename_session(dict(row))
+        return
+
+    if args.dels is not None:
+        cmd_del(args.dels)
+        return
+
+    if args.fzf_lines:
+        cmd_fzf_lines(args.pid)
+        return
+
+    if args.delete:
+        targets = []
+        for sid in args.delete:
+            r = find_row(con, sid)
+            if not r:
+                sys.exit(f"找不到会话: {sid}")
+            targets.append(dict(r))
+        ok = delete_sessions(targets)
+        sys.exit(0 if ok == len(targets) else 1)
+
+    if args.last is not None:
+        rows = load_sessions(con, None)
+        if len(rows) < args.last:
+            sys.exit(f"目前只有 {len(rows)} 个会话，没有第 {args.last} 个")
+        sys.exit(run_resume(rows[args.last - 1], fork=args.fork, dry=args.print_cmd))
+
+    pid = resolve_project(con, args.project) if args.project else None
+
+    if args.list or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        rows = load_sessions(con, pid)
+        if not rows:
+            sys.exit("（没有找到任何会话）")
+        print_list(rows)
+        return
+
+    picker(con, pid, dry=args.print_cmd)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
