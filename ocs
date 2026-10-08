@@ -48,11 +48,13 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import unicodedata
 from datetime import datetime
 from urllib.request import pathname2url
@@ -60,11 +62,12 @@ from urllib.request import pathname2url
 TITLE_FALLBACKS = {"", "new session", "new chat", "新会话"}
 
 RESET = "\x1b[0m"
-# ── opencode 官方 Logo（与 opencode 内置 TUI 逐格 1:1 一致）───────────────
+# ── opencode 官方 Logo（字形与 opencode 内置 TUI 完全一致，颜色自适应终端）──
 # 字形数据 = opencode 源码中的官方 Oa 数据；渲染规则 = 其 TUI 组件：
 #   '_' 色块空格 · '^' 色块▀ · '~' 暗色▀ · ',' 暗色▄ · 其余字符按字母色
-# 颜色：open=#808080（非粗体）· code=#eeeeee（粗体）· 底色=#0a0a0a
-# 暗色 = 字母色 25% 叠在底色上（#282828 / #434343），与 opencode 深色主题一致
+# 颜色：open=#808080（非粗体）· code=#eeeeee（粗体）
+# 暗色 = 字母色 25% 叠在**终端实际背景色**上（启动时用 OSC 11 查询终端）；
+# 查不到时退回 opencode 深色主题的底色 (#0a0a0a → 暗色 #282828/#434343)
 _LOGO_LEFT = (
     "                   ",
     "█▀▀█ █▀▀█ █▀▀█ █▀▀▄",
@@ -77,13 +80,84 @@ _LOGO_RIGHT = (
     "█___ █__█ █__█ █^^^",
     "▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
 )
-_LOGO_BASE = "\x1b[48;2;10;10;10m"  # #0a0a0a 底
-_LOGO_OPEN = ("\x1b[38;2;128;128;128m", "\x1b[38;2;40;40;40m", "\x1b[48;2;40;40;40m")
-_LOGO_CODE = ("\x1b[1m\x1b[38;2;238;238;238m", "\x1b[38;2;67;67;67m", "\x1b[48;2;67;67;67m")
+_LOGO_OPEN_RGB = (128, 128, 128)
+_LOGO_CODE_RGB = (238, 238, 238)
+_LOGO_FALLBACK_BG = (10, 10, 10)
+_logo_bg_cache = []
 
 
-def _logo_half(art, fg, dim, dimbg):
-    """按 opencode TUI 的单元格规则渲染一半（'_'/'^' 带 25% 暗底，'~'/',' 是暗色块）。"""
+def term_bg():
+    """向终端查询背景色（OSC 11）；返回 (r,g,b)，终端不支持或超时返回 None。"""
+    try:
+        import select
+        import termios
+        import tty
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except (ImportError, OSError):
+        return None
+    try:
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)  # 关回显/行缓冲，应答不会被回显也不会被行处理截断
+            os.write(fd, b"\x1b]11;?\x07")
+            buf = b""
+            deadline = time.monotonic() + 0.25
+            while b"\x07" not in buf and b"\x1b\\" not in buf:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                if not select.select([fd], [], [], left)[0]:
+                    break
+                chunk = os.read(fd, 64)
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        m = re.search(rb"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", buf)
+        if m:
+            out = []
+            for g in m.groups():
+                v = int(g, 16)
+                out.append(v >> 8 if len(g) > 2 else v)
+            return tuple(out)
+        m = re.search(rb"#([0-9a-fA-F]{6})", buf)
+        if m:
+            h = m.group(1).decode()
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except (OSError, ValueError):
+        pass
+    finally:
+        os.close(fd)
+    return None
+
+
+def _logo_bg():
+    """本次运行的终端背景色（只查一次）。"""
+    if not _logo_bg_cache:
+        _logo_bg_cache.append(term_bg() or _LOGO_FALLBACK_BG)
+    return _logo_bg_cache[0]
+
+
+def _logo_dim(rgb):
+    """字母色 25% 叠在终端背景色上（opencode 原生公式：mix(bg, color, 0.25)）。"""
+    bg = _logo_bg()
+    return tuple((c * 25 + b * 75 + 50) // 100 for c, b in zip(rgb, bg))
+
+
+def _rgb_fg(c):
+    return f"\x1b[38;2;{c[0]};{c[1]};{c[2]}m"
+
+
+def _rgb_bg(c):
+    return f"\x1b[48;2;{c[0]};{c[1]};{c[2]}m"
+
+
+def _logo_half(art, rgb, bold=False):
+    """按 opencode TUI 的单元格规则渲染一半：'_'/'^' 带 25% 暗底，'~'/',' 是暗色块。"""
+    fg = ("\x1b[1m" if bold else "") + _rgb_fg(rgb)
+    dim = _logo_dim(rgb)
+    dimfg, dimbg = _rgb_fg(dim), _rgb_bg(dim)
     out = []
     for ch in art:
         if ch == "_":
@@ -91,18 +165,18 @@ def _logo_half(art, fg, dim, dimbg):
         elif ch == "^":
             out.append(f"{fg}{dimbg}▀{RESET}")
         elif ch == "~":
-            out.append(f"{dim}{_LOGO_BASE}▀{RESET}")
+            out.append(f"{dimfg}▀{RESET}")
         elif ch == ",":
-            out.append(f"{dim}{_LOGO_BASE}▄{RESET}")
+            out.append(f"{dimfg}▄{RESET}")
         else:
-            out.append(f"{fg}{_LOGO_BASE}{ch}{RESET}")
+            out.append(f"{fg}{ch}{RESET}")
     return "".join(out)
 
 
 def logo_lines():
     """官方 Logo 4 行：左半 open（灰 #808080）· 右半 code（白 #eeeeee、粗体）。"""
     return [
-        _logo_half(l, *_LOGO_OPEN) + _LOGO_BASE + " " + _logo_half(r, *_LOGO_CODE)
+        _logo_half(l, _LOGO_OPEN_RGB) + " " + _logo_half(r, _LOGO_CODE_RGB, bold=True)
         for l, r in zip(_LOGO_LEFT, _LOGO_RIGHT)
     ]
 
@@ -847,6 +921,19 @@ def build_fzf_items(con, pid):
     return items, len(rows)
 
 
+# fzf 信息栏：默认的 "< n/m (0) +T ────" 太吵（+T 是 --track 的标记，后面还跟着一条
+# 分隔线）。改为自绘：有过滤词时显示 "位置/匹配数"（0 条时"无匹配"），多选时追加
+# "已选 n"，其余时间整行留空；计数放提示行最右端，样式压暗。
+_FZF_INFO_CMD = (
+    'i="";'
+    ' if [ -n "$FZF_QUERY" ]; then'
+    '   if [ "${FZF_MATCH_COUNT:-0}" -eq 0 ]; then i="无匹配"; else i="$FZF_POS/$FZF_MATCH_COUNT"; fi;'
+    ' fi;'
+    ' if [ "${FZF_SELECT_COUNT:-0}" -gt 0 ]; then i="${i:+$i · }已选 $FZF_SELECT_COUNT"; fi;'
+    ' [ -n "$i" ] && printf "\\033[2m%s\\033[0m" "$i"; exit 0'
+)
+
+
 def picker(con, pid, dry):
     script = self_path()
     try:
@@ -869,6 +956,7 @@ def picker(con, pid, dry):
         label = "◆ 全部项目"
     header = (
         "\n".join(logo_lines())
+        + "\n" + D("GitHub github.com/duruoxian   博客 duruoxian-blog.pages.dev")
         + f"\n{label} · {nrows} 个会话\n"
         + D("浏览: 打字过滤（含聊天内容） · ↑↓ 选择 · 回车 继续")
         + "\n" + D("视图: → 对话视图 · ← 返回 · 点击消息行 = 展开/收起 AI 回答")
@@ -882,7 +970,10 @@ def picker(con, pid, dry):
         "--delimiter=\t", "--with-nth=1",
         f"--preview={shlex.quote(script)} --show '{{2}}'",
         "--preview-window=right:50%:wrap:border-left",
-        "--prompt=会话❯ ", "--info=inline",
+        "--prompt=会话❯ ",
+        "--info=inline-right:",   # 计数自绘（见 _FZF_INFO_CMD），放提示行最右侧
+        "--no-separator",         # 不要横贯提示行的 ─── 分隔线
+        "--info-command=" + _FZF_INFO_CMD,
         f"--header={header}",
         "--color=prompt:blue,pointer:blue,header:dim",
         "--height=100%",
