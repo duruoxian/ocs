@@ -59,36 +59,52 @@ from urllib.request import pathname2url
 
 TITLE_FALLBACKS = {"", "new session", "new chat", "新会话"}
 
-GRAY, WHITE, RESET = "\x1b[90m", "\x1b[1m\x1b[97m", "\x1b[0m"
-# 官方 Logo 字形（从官方图片逐块提取）：实心块、竖长字形；open 灰 / code 白
-# 每个字母 7 行 × 4 列像素：第 1 行给 d 的上伸，第 7 行给 p 的下伸
-_LOGO_LETTERS = {
-    "o": ("....", "XXXX", "X..X", "X..X", "X..X", "XXXX", "...."),
-    "p": ("....", "XXXX", "X..X", "X..X", "X..X", "XXXX", "X..."),
-    "e": ("....", "XXXX", "X..X", "XXXX", "X...", "XXXX", "...."),
-    "n": ("....", "XXXX", "X..X", "X..X", "X..X", "X..X", "...."),
-    "c": ("....", "XXXX", "X...", "X...", "X...", "XXXX", "...."),
-    "d": ("...X", "XXXX", "X..X", "X..X", "X..X", "XXXX", "...."),
-}
-_LOGO_WORD = "opencode"
+RESET = "\x1b[0m"
+# ── opencode 官方 Logo（与 opencode 内置 TUI 逐格 1:1 一致）───────────────
+# 字形数据 = opencode 源码中的官方 Oa 数据；渲染规则 = 其 TUI 组件：
+#   '_' 色块空格 · '^' 色块▀ · '~' 暗色▀ · ',' 暗色▄ · 其余字符按字母色
+# 颜色：open=#808080（非粗体）· code=#eeeeee（粗体）· 底色=#0a0a0a
+# 暗色 = 字母色 25% 叠在底色上（#282828 / #434343），与 opencode 深色主题一致
+_LOGO_LEFT = (
+    "                   ",
+    "█▀▀█ █▀▀█ █▀▀█ █▀▀▄",
+    "█__█ █__█ █^^^ █__█",
+    "▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀~~▀",
+)
+_LOGO_RIGHT = (
+    "             ▄     ",
+    "█▀▀▀ █▀▀█ █▀▀█ █▀▀█",
+    "█___ █__█ █__█ █^^^",
+    "▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
+)
+_LOGO_BASE = "\x1b[48;2;10;10;10m"  # #0a0a0a 底
+_LOGO_OPEN = ("\x1b[38;2;128;128;128m", "\x1b[38;2;40;40;40m", "\x1b[48;2;40;40;40m")
+_LOGO_CODE = ("\x1b[1m\x1b[38;2;238;238;238m", "\x1b[38;2;67;67;67m", "\x1b[48;2;67;67;67m")
+
+
+def _logo_half(art, fg, dim, dimbg):
+    """按 opencode TUI 的单元格规则渲染一半（'_'/'^' 带 25% 暗底，'~'/',' 是暗色块）。"""
+    out = []
+    for ch in art:
+        if ch == "_":
+            out.append(f"{fg}{dimbg} {RESET}")
+        elif ch == "^":
+            out.append(f"{fg}{dimbg}▀{RESET}")
+        elif ch == "~":
+            out.append(f"{dim}{_LOGO_BASE}▀{RESET}")
+        elif ch == ",":
+            out.append(f"{dim}{_LOGO_BASE}▄{RESET}")
+        else:
+            out.append(f"{fg}{_LOGO_BASE}{ch}{RESET}")
+    return "".join(out)
 
 
 def logo_lines():
-    """半块字符（▀▄█）渲染：7 行像素网格压缩为 4 个终端行，整体比例与官方图一致。"""
-    grids = [_LOGO_LETTERS[ch] for ch in _LOGO_WORD]
-    lines = []
-    for dr in range(0, 7, 2):
-        segs = []
-        for i, g in enumerate(grids):
-            color = GRAY if i < 4 else WHITE  # open 灰 / code 白
-            s = ""
-            for col in range(4):
-                top = g[dr][col] == "X"
-                bot = dr + 1 < 7 and g[dr + 1][col] == "X"
-                s += "█" if top and bot else "▀" if top else "▄" if bot else " "
-            segs.append(color + s + RESET)
-        lines.append(" ".join(segs))
-    return lines
+    """官方 Logo 4 行：左半 open（灰 #808080）· 右半 code（白 #eeeeee、粗体）。"""
+    return [
+        _logo_half(l, *_LOGO_OPEN) + _LOGO_BASE + " " + _logo_half(r, *_LOGO_CODE)
+        for l, r in zip(_LOGO_LEFT, _LOGO_RIGHT)
+    ]
 
 
 def C(s):   # 蓝色（部分主题会把 cyan 显示成刺眼的绿色，所以统一用 blue）
