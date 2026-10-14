@@ -42,6 +42,40 @@ cd ocs
 install -m 755 ocs ~/.local/bin/ocs   # 确保 ~/.local/bin 在 PATH 里
 ```
 
+## Windows（PowerShell）
+
+Windows 上用 `ocs.ps1`（一个薄的 PowerShell 启动器，核心逻辑仍是同一个 `ocs` Python 脚本）。
+Windows PowerShell 5.1 和 PowerShell 7 都可以。
+
+依赖：
+
+```powershell
+winget install Python.Python.3.12     # 若还没有 Python
+winget install junegunn.fzf           # 交互界面
+# opencode 需已安装并使用过（数据在 %USERPROFILE%\.local\share\opencode\opencode.db）
+```
+
+安装到 `~/.local/bin` 并加入 PATH：
+
+```powershell
+cd ocs
+./install.ps1
+```
+
+安装脚本会放三个文件：`ocs`（Python 逻辑）、`ocs.ps1`（启动器）、`ocs.cmd`（让裸命令 `ocs` 能被解析）。
+然后新开一个 PowerShell 窗口，输入 `ocs` 即可。
+
+> 如果提示脚本被禁止运行（执行策略），用 `ocs` 的 `.cmd` 入口即可（它已带
+> `-ExecutionPolicy Bypass`）；也可以运行 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
+
+Windows 与 Linux 的差异：
+
+- 复制文字：直接用鼠标拖动选中、右键「复制」即可，**不需要** `F8`/`右键` 切换鼠标归属；
+  `ctrl-y` 复制会话 ID 依然可用（走 `clip`）。
+- 分组行（项目/目录）同样支持 `→` 进入对话视图；展开/收起 AI 回答、重命名、删除、分叉、
+  `--last`/`--show`/`--delete`/`-l` 等全部一致。
+- 使用 Windows Terminal 时鼠标点击、滚轮、方向键都可用。
+
 ## 使用
 
 ```bash

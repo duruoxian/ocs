@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ocs — opencode 会话选择器（ZCode 风格）。
+r"""ocs — opencode 会话选择器（ZCode 风格）。
 
 像 ZCode 一样浏览和管理 opencode 历史会话：按项目分组、模糊搜索（含会话内容）、
 右侧预览、回车继续；支持对话视图（收起/展开 AI 回答）、重命名、批量删除。
@@ -22,12 +22,14 @@
   再点击 / 再按 →        收起该条 AI 回答
   右侧预览               显示光标所在那一条的完整问答
 
-【三】复制文字
+【三】复制文字（Linux 终端）
   右键一次（或 F8）      把鼠标交给终端，之后：
                           · 按住拖动   = 选中文字（不用按 Shift）
                           · 右键       = 直接弹出「复制」菜单
   按 F8                  切回点击模式（平时：箭头光标、可点会话）
   ctrl-y                 一键复制当前会话的 ID
+
+  （Windows 下直接用鼠标拖动选中，再右键即「复制」，无需 F8；ctrl-y 同样可用）
 
 【四】会话管理
   ctrl-r                 重命名会话
@@ -44,6 +46,7 @@
   ocs -l                 纯文本列表（适合管道/脚本）
 
 依赖: python3、fzf　|　数据: ~/.local/share/opencode/opencode.db
+Windows: 用 PowerShell 运行同目录的 ocs.ps1（数据在 %USERPROFILE%\.local\share\opencode\opencode.db）
 """
 import argparse
 import json
@@ -54,12 +57,30 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from datetime import datetime
 from urllib.request import pathname2url
 
+IS_WIN = os.name == "nt"
+
+if IS_WIN:  # Windows 控制台默认 GBK，无法编码 •/◆ 等符号，强制 UTF-8
+    for _stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+
 TITLE_FALLBACKS = {"", "new session", "new chat", "新会话"}
+
+
+def q(s):
+    """把单个参数包成当前 fzf 子 shell（cmd / sh）能正确解析的引号形式。"""
+    s = str(s)
+    if IS_WIN:
+        return '"' + s.replace('"', '""') + '"'
+    return shlex.quote(s)
 
 RESET = "\x1b[0m"
 # ── opencode 官方 Logo（字形与 opencode 内置 TUI 完全一致，颜色自适应终端）──
@@ -88,6 +109,8 @@ _logo_bg_cache = []
 
 def term_bg():
     """向终端查询背景色（OSC 11）；返回 (r,g,b)，终端不支持或超时返回 None。"""
+    if IS_WIN:  # Windows 下不查询，直接用 opencode 深色主题底色
+        return None
     try:
         import select
         import termios
@@ -277,6 +300,13 @@ def self_path():
     return shutil.which(a0) or os.path.abspath(a0)
 
 
+def self_cmd():
+    """把「重新调用本脚本」做成一条 shell 命令片段（供 fzf execute/preview 用）。"""
+    if IS_WIN:
+        return q(sys.executable) + " " + q(self_path())
+    return shlex.quote(self_path())
+
+
 # ---------- 鼠标归属运行时切换 ----------
 # 终端里鼠标同一时刻只能归一边：程序占用时可点击列表，但拖动/右键归程序。
 # 通过转义序列在运行时切换（Konsole 实时解析，fzf 无感知），
@@ -285,15 +315,44 @@ MOUSE_OFF = "\033[?1000l\033[?1002l\033[?1006l"  # 鼠标归终端：拖动选�
 MOUSE_ON = "\033[?1000h\033[?1002h\033[?1006h"   # 鼠标归程序：点击列表、双击继续
 
 
-def mouse_state_path():
+def _state_dir():
     try:
-        tty = os.path.realpath("/dev/tty")
-        return "/tmp/ocs-mouse-" + os.path.basename(tty)
+        d = os.path.join(tempfile.gettempdir(), "ocs")
+        os.makedirs(d, exist_ok=True)
+        return d
     except OSError:
-        return "/tmp/ocs-mouse-default"
+        return tempfile.gettempdir()
+
+
+def _tty_id():
+    """当前终端的一个稳定标识：同一终端里的所有 ocs 子进程应得到同一个值。"""
+    if IS_WIN:
+        try:
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                return "win-%x" % hwnd  # fzf 的 execute 子进程共享同一控制台窗口
+        except Exception:
+            pass
+        for v in ("WT_SESSION", "SESSIONNAME", "TERM_SESSION_ID"):
+            if os.environ.get(v):
+                return "env-" + re.sub(r"[^0-9A-Za-z]", "", os.environ[v])[:24]
+        return "pid-" + str(os.getpid())
+    try:
+        return os.path.basename(os.path.realpath("/dev/tty"))
+    except OSError:
+        return "default"
+
+
+def mouse_state_path():
+    if IS_WIN:
+        return os.path.join(_state_dir(), "mouse-" + _tty_id())
+    return "/tmp/ocs-mouse-" + _tty_id()
 
 
 def write_tty(s):
+    if IS_WIN:  # 鼠标归属切换是 Linux 终端专属，Windows 下忽略
+        return
     try:
         fd = os.open("/dev/tty", os.O_WRONLY)
         try:
@@ -324,11 +383,9 @@ def cmd_toggle_mouse():
 # ---------- 对话视图（默认只显示用户提问，点击展开/折叠 AI 回答） ----------
 
 def ui_state_path():
-    try:
-        tty = os.path.realpath("/dev/tty")
-        return "/tmp/ocs-ui-" + os.path.basename(tty)
-    except OSError:
-        return "/tmp/ocs-ui-default"
+    if IS_WIN:
+        return os.path.join(_state_dir(), "ui-" + _tty_id())
+    return "/tmp/ocs-ui-" + _tty_id()
 
 
 def ui_state():
@@ -390,6 +447,8 @@ def cmd_nav_right(mid):
         return
     if mid.startswith("ses"):
         ui_state_set({"view": "msg", "sid": mid, "expanded": []})
+    elif mid.startswith("@ses:"):
+        ui_state_set({"view": "msg", "sid": mid[5:], "expanded": []})
 
 
 def cmd_nav_left(mid):
@@ -472,7 +531,7 @@ def group_of(r):
     if wt and wt != "/" and r.get("pid"):
         return ("p:" + r["pid"], r.get("pname") or proj_label(r), wt)
     d = r.get("directory") or wt or "?"
-    return ("d:" + d, os.path.basename(d.rstrip("/")) or d, d)
+    return ("d:" + d, os.path.basename(d.rstrip("/\\")) or d, d)
 
 
 def load_sessions(con, pid):
@@ -585,7 +644,7 @@ def proj_label(r):
     wt = r.get("worktree") or ""
     if wt == "/":
         return "/"
-    return os.path.basename(wt.rstrip("/")) or wt or "?"
+    return os.path.basename(wt.rstrip("/\\")) or wt or "?"
 
 
 def project_dirs(con, pid):
@@ -599,15 +658,19 @@ def project_dirs(con, pid):
 
 
 def dir_match(d, target):
-    d = d.rstrip("/") or "/"
-    return target == d or target.startswith(d.rstrip("/") + "/")
+    d = (d or "").replace("\\", "/").rstrip("/") or "/"
+    t = (target or "").replace("\\", "/").rstrip("/") or "/"
+    if IS_WIN:
+        d, t = d.lower(), t.lower()
+    return t == d or t.startswith(d.rstrip("/") + "/")
 
 
 def resolve_project(con, target):
     target = os.path.abspath(os.path.expanduser(target))
+    tc = os.path.normcase(target)
     projects = con.execute("SELECT id, worktree, name FROM project").fetchall()
     for r in projects:
-        if r["worktree"] and os.path.abspath(r["worktree"]) == target:
+        if r["worktree"] and os.path.normcase(os.path.abspath(r["worktree"])) == tc:
             return r["id"]
     for r in projects:
         if any(dir_match(d, target) for d in project_dirs(con, r["id"])):
@@ -633,6 +696,8 @@ def stats(r):
 
 def term_cols():
     """终端真实列数：优先问 /dev/tty（reload 等子进程的 stdout 是管道，量不到）。"""
+    if IS_WIN:
+        return shutil.get_terminal_size((120, 24)).columns
     try:
         fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
         try:
@@ -818,7 +883,20 @@ def delete_sessions(targets):
 
 
 def copy_to_clipboard(text):
-    """写入系统剪贴板：wl-copy (Wayland) → xclip/xsel (X11) → OSC 52 终端转义。"""
+    """写入系统剪贴板：Windows 用 clip；Linux 用 wl-copy → xclip/xsel → OSC 52。"""
+    if IS_WIN:
+        try:
+            p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=False)
+            p.communicate(text.encode("utf-16le"))  # clip 按 UTF-16LE 读入
+            return p.returncode == 0
+        except OSError:
+            pass
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", "Set-Clipboard"],
+                           input=text, text=True, capture_output=True, timeout=10)
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     try:
         # wl-copy 会常驻后台提供剪贴板服务，不能等待其退出
         p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE,
@@ -935,7 +1013,7 @@ _FZF_INFO_CMD = (
 
 
 def picker(con, pid, dry):
-    script = self_path()
+    script = self_cmd()
     try:
         os.unlink(mouse_state_path())  # 新会话从点击模式开始
     except OSError:
@@ -954,6 +1032,11 @@ def picker(con, pid, dry):
         label = "◆ " + (prow["name"] or proj_label({"pname": None, "worktree": prow["worktree"]})) if prow else "◆ 项目"
     else:
         label = "◆ 全部项目"
+    copy_hint = (
+        "复制: ctrl-y 复制会话 ID · 鼠标按住拖动选中 · 右键「复制」"
+        if IS_WIN else
+        "复制: 右键/F8 交鼠标给终端 → 拖动选中 · 右键「复制」; F8 切回"
+    )
     header = (
         "\n".join(logo_lines())
         + "\n" + D("GitHub github.com/duruoxian   博客 duruoxian-blog.pages.dev")
@@ -961,14 +1044,14 @@ def picker(con, pid, dry):
         + D("浏览: 打字过滤（含聊天内容） · ↑↓ 选择 · 回车 继续")
         + "\n" + D("视图: → 对话视图 · ← 返回 · 点击消息行 = 展开/收起 AI 回答")
         + "\n" + D("管理: ctrl-r 重命名 · ctrl-d 删除（组头=整组 · tab 多选） · esc 退出")
-        + "\n" + D("复制: 右键/F8 交鼠标给终端 → 拖动选中 · 右键「复制」; F8 切回")
+        + "\n" + D(copy_hint)
     )
     # 所有操作通过 execute 在界面内完成，reload 刷新列表；esc 才退出
-    reload_cmd = shlex.quote(script) + " --fzf-lines" + (f" --pid {shlex.quote(pid)}" if pid else "")
+    reload_cmd = script + " --fzf-lines" + (f" --pid {q(pid)}" if pid else "")
     cmd = [
         "fzf", "--ansi", "--layout=reverse", "--multi", "--marker=✓", "--wrap=word", "--track",
         "--delimiter=\t", "--with-nth=1",
-        f"--preview={shlex.quote(script)} --show '{{2}}'",
+        f"--preview={script} --show {{2}}",
         "--preview-window=right:50%:wrap:border-left",
         "--prompt=会话❯ ",
         "--info=inline-right:",   # 计数自绘（见 _FZF_INFO_CMD），放提示行最右侧
@@ -977,26 +1060,31 @@ def picker(con, pid, dry):
         f"--header={header}",
         "--color=prompt:blue,pointer:blue,header:dim",
         "--height=100%",
-        f"--bind=enter:execute({shlex.quote(script)} --resume {{2}})+reload({reload_cmd})",
-        f"--bind=ctrl-e:execute({shlex.quote(script)} --fork --resume {{2}})+reload({reload_cmd})",
-        f"--bind=ctrl-y:execute-silent({shlex.quote(script)} --copy {{2}})",
-        f"--bind=ctrl-r:execute({shlex.quote(script)} --rename {{2}})+reload({reload_cmd})",
-        f"--bind=ctrl-d:execute({shlex.quote(script)} --dels {{+2}})+reload({reload_cmd})",
-        f"--bind=double-click:execute({shlex.quote(script)} --resume {{2}})+reload({reload_cmd})",
+        f"--bind=enter:execute({script} --resume {{2}})+reload({reload_cmd})",
+        f"--bind=ctrl-e:execute({script} --fork --resume {{2}})+reload({reload_cmd})",
+        f"--bind=ctrl-y:execute-silent({script} --copy {{2}})",
+        f"--bind=ctrl-r:execute({script} --rename {{2}})+reload({reload_cmd})",
+        f"--bind=ctrl-d:execute({script} --dels {{+2}})+reload({reload_cmd})",
+        f"--bind=double-click:execute({script} --resume {{2}})+reload({reload_cmd})",
         # 对话视图：→ 打开/展开 · ← 返回 · 单击消息行=展开/收起 AI 回答
-        f"--bind=right:execute-silent({shlex.quote(script)} --nav-right {{2}})+reload({reload_cmd})",
-        f"--bind=left:execute-silent({shlex.quote(script)} --nav-left {{2}})+reload({reload_cmd})",
-        f"--bind=left-click:execute-silent({shlex.quote(script)} --click {{2}})+reload({reload_cmd})",
-        # 右键 = 把鼠标交给终端（随后：拖动选字、右键「复制」菜单）；F8 切回点击模式
-        f"--bind=right-click:execute-silent({shlex.quote(script)} --select-mouse)",
-        f"--bind=F8:execute-silent({shlex.quote(script)} --toggle-mouse)",
-        # Ctrl+C 交给终端（选中文字时复制）；在 ocs 内不响应，避免误退出
-        "--bind=ctrl-c:ignore",
+        f"--bind=right:execute-silent({script} --nav-right {{2}})+reload({reload_cmd})",
+        f"--bind=left:execute-silent({script} --nav-left {{2}})+reload({reload_cmd})",
+        f"--bind=left-click:execute-silent({script} --click {{2}})+reload({reload_cmd})",
     ]
+    if not IS_WIN:
+        # 右键/F8 切换鼠标归属是 Linux 终端专属（Windows 终端不支持该转义序列）
+        cmd += [
+            f"--bind=right-click:execute-silent({script} --select-mouse)",
+            f"--bind=F8:execute-silent({script} --toggle-mouse)",
+        ]
+    # Ctrl+C 交给终端（选中文字时复制）；在 ocs 内不响应，避免误退出
+    cmd.append("--bind=ctrl-c:ignore")
     try:
-        subprocess.run(cmd, input="\n".join(l for l, _ in items), text=True)
+        subprocess.run(cmd, input="\n".join(l for l, _ in items), text=True,
+                       encoding="utf-8", errors="replace")
     except FileNotFoundError:
-        sys.exit("需要 fzf：请先安装（pacman -S fzf），或改用 ocs -l 列表模式")
+        sys.exit("需要 fzf：请先安装（Windows: winget install junegunn.fzf；"
+                 "Linux: pacman -S fzf），或改用 ocs -l 列表模式")
 
 
 def cmd_resume(ids, fork):
@@ -1023,6 +1111,9 @@ def cmd_resume(ids, fork):
     args = ["opencode", "--session", row["id"]]
     if fork:
         args.append("--fork")
+    if IS_WIN:
+        exe = shutil.which("opencode") or "opencode"
+        sys.exit(subprocess.run([exe] + args[1:], cwd=d or None).returncode)
     if d:
         os.chdir(d)
     os.execvp("opencode", args)
@@ -1038,8 +1129,8 @@ def cmd_copy(sid):
     row = find_row(con, sid)
     if row:
         copy_to_clipboard(row["id"])
-        import time
-        time.sleep(0.1)  # 等 wl-copy 完成剪贴板登记，避免 ocs 退出太快丢失
+        if not IS_WIN:
+            time.sleep(0.1)  # 等 wl-copy 完成剪贴板登记，避免 ocs 退出太快丢失
 
 
 def cmd_del(tokens):
