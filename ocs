@@ -265,6 +265,11 @@ def clean_text(t):
     return t
 
 
+def oneline(s):
+    """压成单行：fzf 的列表项/隐藏字段不能含换行或制表符。"""
+    return " ".join((s or "").split())
+
+
 def rel_time(ms):
     dt = datetime.fromtimestamp(ms / 1000)
     sec = (datetime.now() - dt).total_seconds()
@@ -487,13 +492,13 @@ def message_pairs(con, sid):
                 t = ""
             if t:
                 texts.append(t)
-        body = " ".join(" ".join(texts).split())
+        body = "\n\n".join(x.strip() for x in texts if x.strip())
         if role == "user":
             if cur:
                 pairs.append(cur)
             cur = [body, ""]
         elif role == "assistant" and cur is not None:
-            cur[1] = (cur[1] + " " + body).strip() if cur[1] else body
+            cur[1] = (cur[1] + "\n\n" + body).strip() if cur[1] else body
     if cur:
         pairs.append(cur)
     return pairs
@@ -960,10 +965,10 @@ def build_msg_items(con, sid):
     for i, (q, a) in enumerate(pairs):
         mid = f"m:{sid}:{i}"
         disp = C("提问│") + trunc(q, 160)
-        items.append((disp + "\t" + mid + "\t" + q + " " + a, None))
+        items.append((disp + "\t" + mid + "\t" + oneline(q + " " + a), None))
         if i in expanded:
-            body = a if a else "（没有文本回答）"
-            items.append((M("AI │") + body + "\t" + mid + "\t" + a, None))
+            body = oneline(a) if a else "（没有文本回答）"
+            items.append((M("AI │") + body + "\t" + mid + "\t" + oneline(a), None))
     return items
 
 
