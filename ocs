@@ -50,6 +50,7 @@ Windows: 用 PowerShell 运行同目录的 ocs.ps1（数据在 %USERPROFILE%\.lo
 """
 import argparse
 import json
+from collections import Counter
 import os
 import re
 import shlex
@@ -250,7 +251,16 @@ def pad(s, w):
 
 def trunc(s, n):
     s = " ".join((s or "").split())
-    return s if dw(s) <= n else s[:n] + "…"
+    if dw(s) <= n:
+        return s
+    out, w = [], 0
+    for ch in s:  # 按显示宽度截断：CJK 占 2 列，按字符数切会把列挤歪
+        cw = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        if w + cw > n - 1:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out) + "…"
 
 
 def clean_text(t):
@@ -468,39 +478,52 @@ def cmd_click(mid):
     toggle_msg(mid)
 
 
-def message_pairs(con, sid):
-    """按时间正序返回 [(用户消息, 紧随其后的 AI 回复文本或 "")]。"""
-    rows = con.execute(
-        "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, id",
-        (sid,),
-    ).fetchall()
-    pairs, cur = [], None
-    for mid, mdata in rows:
-        try:
-            role = json.loads(mdata).get("role")
-        except ValueError:
-            role = None
-        texts = []
-        for (d,) in con.execute(
-            """SELECT data FROM part WHERE message_id = ?
-               AND json_extract(data, '$.type') = 'text' ORDER BY id""",
-            (mid,),
-        ):
-            try:
-                t = clean_text(json.loads(d).get("text", ""))
-            except ValueError:
-                t = ""
-            if t:
-                texts.append(t)
+def message_pairs(con, sid, upto=None):
+    """按时间正序返回 [(用户消息, 紧随其后的 AI 回复文本或 "")]。
+
+    单次 JOIN 查询取整个会话的消息与文本 part（原先每条消息一次查询）；
+    upto=N 时凑够 N+1 对即停，预览单条消息不必拉全整个会话。
+    """
+    def flush(pair):
         body = "\n\n".join(x.strip() for x in texts if x.strip())
         if role == "user":
-            if cur:
-                pairs.append(cur)
-            cur = [body, ""]
-        elif role == "assistant" and cur is not None:
-            cur[1] = (cur[1] + "\n\n" + body).strip() if cur[1] else body
-    if cur:
-        pairs.append(cur)
+            if pair:
+                pairs.append(pair)
+            return [body, ""]
+        if role == "assistant" and pair is not None:
+            pair[1] = (pair[1] + "\n\n" + body).strip() if pair[1] else body
+        return pair
+
+    cur = con.execute(
+        """SELECT m.id, m.data, p2.data
+           FROM message m LEFT JOIN part p2
+             ON p2.message_id = m.id AND json_extract(p2.data, '$.type') = 'text'
+           WHERE m.session_id = ?
+           ORDER BY m.time_created, m.id, p2.id""",
+        (sid,),
+    )
+    pairs, pair = [], None
+    role, texts, last_mid = None, [], None
+    for mid, mdata, pdata in cur:
+        if upto is not None and len(pairs) > upto:
+            return pairs
+        if mid != last_mid:
+            pair = flush(pair)
+            texts = []
+            last_mid = mid
+            try:
+                role = json.loads(mdata).get("role")
+            except (ValueError, AttributeError):
+                role = None
+        if pdata:
+            try:
+                t = clean_text(json.loads(pdata).get("text", ""))
+            except (ValueError, AttributeError):
+                t = ""
+            texts.append(t)
+    pair = flush(pair)
+    if pair:  # 最后一对问答不在任何“下一条消息”的 flush 里，这里补上
+        pairs.append(pair)
     return pairs
 
 
@@ -539,16 +562,106 @@ def group_of(r):
     return ("d:" + d, os.path.basename(d.rstrip("/\\")) or d, d)
 
 
-def load_sessions(con, pid):
+def _chunked(items, size=400):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def batch_user_texts(con, sids, limit=60):
+    """一次查询取所有会话的用户提问文本（每会话前 limit 条，时间正序）。
+
+    供标题回退与内容搜索共用；原先每会话一条查询，会话一多每次 reload 全是 N+1。
+    """
+    out = {}
+    sids = list(sids)
+    if not sids:
+        return out
+    for chunk in _chunked(sids):
+        qm = ",".join("?" * len(chunk))
+        for sid, d in con.execute(
+            f"""SELECT session_id, data FROM (
+                  SELECT m.session_id AS session_id, p2.data AS data,
+                         ROW_NUMBER() OVER (PARTITION BY m.session_id
+                                            ORDER BY m.time_created, p2.id) rn
+                  FROM message m JOIN part p2 ON p2.message_id = m.id
+                  WHERE m.session_id IN ({qm})
+                    AND json_extract(m.data, '$.role') = 'user'
+                    AND json_extract(p2.data, '$.type') = 'text'
+                ) WHERE rn <= {int(limit)} ORDER BY session_id, rn""",
+            chunk,
+        ):
+            try:
+                t = clean_text(json.loads(d).get("text", ""))
+            except (ValueError, AttributeError):
+                t = ""
+            if t:
+                out.setdefault(sid, []).append(t)
+    return out
+
+
+def batch_last_replies(con, sids):
+    """一次查询取每个会话最后一条 AI 回复的文本。返回 {sid: text}。"""
+    out = {}
+    sids = list(sids)
+    if not sids:
+        return out
+    for chunk in _chunked(sids):
+        qm = ",".join("?" * len(chunk))
+        for sid, d in con.execute(
+            f"""SELECT session_id, data FROM (
+                  SELECT m.session_id AS session_id, p2.data AS data, p2.id,
+                         DENSE_RANK() OVER (PARTITION BY m.session_id
+                                            ORDER BY m.time_created DESC, m.id DESC) rnk
+                  FROM message m JOIN part p2 ON p2.message_id = m.id
+                  WHERE m.session_id IN ({qm})
+                    AND json_extract(m.data, '$.role') = 'assistant'
+                    AND json_extract(p2.data, '$.type') = 'text'
+                ) WHERE rnk = 1 ORDER BY session_id, id""",
+            chunk,
+        ):
+            try:
+                t = clean_text(json.loads(d).get("text", ""))
+            except (ValueError, AttributeError):
+                t = ""
+            if t:
+                out.setdefault(sid, []).append(t)
+    return {s: "\n".join(ts) for s, ts in out.items()}
+
+
+def build_search(texts, reply):
+    """会话内容摘要（fzf 隐藏字段，供全文搜索）：全部用户提问 + 最后一条回复。"""
+    parts = [oneline(t)[:200] for t in texts]
+    if reply:
+        parts.append(oneline(reply)[:200])
+    return " ".join(parts)[:4000]
+
+
+def load_sessions(con, pid=None, directory=None):
     sql, params = SQL, []
     if pid:
         sql += " AND s.project_id = ?"
         params.append(pid)
+    if directory:  # 按运行目录分组键过滤，取值规则与 group_of 一致（worktree 在 project 表）
+        if directory == "?":
+            sql += " AND COALESCE(NULLIF(s.directory, ''), NULLIF(p.worktree, '')) IS NULL"
+        else:
+            sql += " AND COALESCE(NULLIF(s.directory, ''), NULLIF(p.worktree, '')) = ?"
+            params.append(directory)
     rows = [dict(r) for r in con.execute(sql, params)]
     counts = dict(con.execute("SELECT session_id, COUNT(*) FROM message GROUP BY session_id"))
+    sids = [r["id"] for r in rows]
+    utexts = batch_user_texts(con, sids)
+    replies = batch_last_replies(con, sids)
     for r in rows:
         r["msgs"] = counts.get(r["id"], 0)
-        ensure_title(con, r)
+        texts = utexts.get(r["id"], [])
+        t = (r["title"] or "").strip()
+        if t.lower() in TITLE_FALLBACKS:
+            t = ""
+        if not t:  # 标题回退与 ensure_title 一致，批量做省去每会话一条查询
+            t = trunc(texts[0], 30) if texts else "(无标题)"
+        r["title"] = t
+        r["search"] = build_search(texts, replies.get(r["id"], ""))
         r["gkey"], r["glabel"], r["gpath"] = group_of(r)
     rows.sort(key=lambda r: r["time_updated"], reverse=True)
     return rows
@@ -578,44 +691,11 @@ def first_user_texts(con, sid, limit=None):
     for r in con.execute(sql, params):
         try:
             t = clean_text(json.loads(r[0]).get("text", ""))
-        except ValueError:
+        except (ValueError, AttributeError):
             t = ""
         if t:
             out.append(t)
     return out
-
-
-def last_assistant_text(con, sid):
-    row = con.execute(
-        """SELECT id FROM message
-           WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant'
-           ORDER BY time_created DESC, id DESC LIMIT 1""",
-        (sid,),
-    ).fetchone()
-    if not row:
-        return ""
-    texts = []
-    for (d,) in con.execute(
-        """SELECT data FROM part WHERE message_id = ?
-           AND json_extract(data, '$.type') = 'text' ORDER BY id""",
-        (row[0],),
-    ):
-        try:
-            t = clean_text(json.loads(d).get("text", ""))
-        except ValueError:
-            t = ""
-        if t:
-            texts.append(t)
-    return "\n".join(texts)
-
-
-def search_text(con, r):
-    """会话内容摘要：用于 fzf 全文搜索（隐藏字段）。"""
-    parts = first_user_texts(con, r["id"], 2)
-    reply = last_assistant_text(con, r["id"])
-    if reply:
-        parts.append(reply)
-    return " ".join(" ".join(parts).split())[:400]
 
 
 def model_of(con, r):
@@ -728,16 +808,26 @@ def fzf_line(r, tw, indent=""):
 
 
 def print_history(con, sid):
-    """会话预览里的历史消息：默认只显示用户提问，AI 回答在对话视图里点开。"""
-    pairs = message_pairs(con, sid)
+    """会话预览里的历史消息：默认只显示用户提问，AI 回答在对话视图里点开。
+
+    预览窗不可滚动，只列前 20 条；光标每动一次都重跑，避免拉全整个会话。
+    """
+    texts = first_user_texts(con, sid, 20)
     print(f"\n{C('── 我提过的问题 ' + '─' * 20)}")
-    if not pairs:
+    if not texts:
         print(D("（没有文本消息）"))
         return
-    for q, _ in pairs:
+    for q in texts:
         print(C("•") + " " + trunc(q, 96))
-    if any(a for _, a in pairs):
+    has_reply = con.execute(
+        """SELECT 1 FROM message WHERE session_id = ?
+           AND json_extract(data, '$.role') = 'assistant' LIMIT 1""",
+        (sid,),
+    ).fetchone()
+    if has_reply:
         print(D("（按 → 打开对话视图，点消息行可展开/收起 AI 回答）"))
+    if len(texts) == 20:
+        print(D("（长会话仅列前 20 条提问，按 → 看完整对话）"))
 
 
 def print_message_detail(con, mid):
@@ -746,7 +836,7 @@ def print_message_detail(con, mid):
     if not pm:
         return
     sid, idx = pm
-    pairs = message_pairs(con, sid)
+    pairs = message_pairs(con, sid, upto=idx)  # 只要第 idx 对，凑够即停
     if idx >= len(pairs):
         print(D("（消息不存在）"))
         return
@@ -812,7 +902,7 @@ def show_group_preview(con, key):
         path = prow["worktree"] or "?"
     else:
         d = key[2:]
-        rows = [r for r in load_sessions(con, None) if (r.get("directory") or "") == d]
+        rows = load_sessions(con, directory=d)  # SQL 里过滤，不必载入全部会话
         label = os.path.basename(d.rstrip("/")) or d
         path = d
     print(B(C("◆ " + label)))
@@ -833,10 +923,11 @@ def show_group_preview(con, key):
 
 def print_list(rows):
     cur = object()
+    counts = Counter(r["gkey"] for r in rows)
     for r in rows:
         if r["gkey"] != cur:
             cur = r["gkey"]
-            n = sum(1 for x in rows if x["gkey"] == r["gkey"])
+            n = counts[r["gkey"]]
             print(f"\n{B(C('◆ ' + r['glabel']))} {D('— ' + r['gpath'] + f' · {n} 个会话')}")
         line = "  " + B(pad(trunc(r["title"], 42), 44))
         line += "  " + D(pad(rel_time(r["time_updated"]), 10))
@@ -847,8 +938,16 @@ def print_list(rows):
 
 # ---------- 动作 ----------
 
-def run_resume(row, fork, dry):
-    """启动 opencode 续接会话。dry=True 只打印命令。返回退出码。"""
+def opencode_exe():
+    """opencode 可执行文件；缺失时给中文提示而不是裸 traceback。"""
+    exe = shutil.which("opencode")
+    if not exe:
+        sys.exit("未找到 opencode 命令：请先安装 opencode 并加入 PATH")
+    return exe
+
+
+def resume_plan(row, fork):
+    """续接一个会话的公共逻辑：返回 (工作目录, 参数列表)。"""
     d = ""
     for cand in (row.get("directory"), row.get("worktree")):
         if cand and os.path.isdir(cand):
@@ -857,16 +956,24 @@ def run_resume(row, fork, dry):
     args = ["opencode", "--session", row["id"]]
     if fork:
         args.append("--fork")
+    return d, args
+
+
+def run_resume(row, fork, dry):
+    """启动 opencode 续接会话。dry=True 只打印命令。返回退出码。"""
+    d, args = resume_plan(row, fork)
     if dry:
         print((f"cd {shlex.quote(d)} && " if d else "") + shlex.join(args))
         return 0
+    exe = opencode_exe()
     t = trunc(row["title"], 50)
     print(D(f"▸ 继续会话: {t} ({rel_time(row['time_updated'])}) — opencode 退出后回到列表"))
-    return subprocess.run(args, cwd=d or None).returncode
+    return subprocess.run([exe] + args[1:], cwd=d or None).returncode
 
 
 def delete_sessions(targets):
     """删除会话列表（每项需含 id/title），已含确认。返回成功数。"""
+    exe = opencode_exe()  # 先确认 opencode 可用，再让用户确认删除
     print("将删除:")
     for r in targets[:8]:
         print("  " + trunc(r["title"], 44) + D("  " + r["id"]))
@@ -881,7 +988,7 @@ def delete_sessions(targets):
         return 0
     ok = 0
     for r in targets:
-        rc = subprocess.run(["opencode", "session", "delete", r["id"]]).returncode
+        rc = subprocess.run([exe, "session", "delete", r["id"]]).returncode
         ok += rc == 0
         print(("✓ 已删除 " if rc == 0 else "✗ 删除失败 ") + r["id"])
     return ok
@@ -944,6 +1051,10 @@ def rename_session(row):
     try:
         con2.execute("UPDATE session SET title = ? WHERE id = ?", (new, row["id"]))
         con2.commit()
+    except sqlite3.OperationalError as e:
+        print(f"✗ 重命名失败：{e}")
+        print(D("（opencode 可能正占用数据库，稍后再试；原标题未改动）"))
+        return
     finally:
         con2.close()
     row["title"] = new
@@ -978,11 +1089,16 @@ def build_fzf_items(con, pid):
     if st.get("view") == "msg" and st.get("sid"):
         mitems = build_msg_items(con, st["sid"])
         if mitems is not None:
-            return mitems, len(load_sessions(con, pid))
+            total_sql = ("SELECT COUNT(*) FROM session WHERE parent_id IS NULL"
+                         " AND time_archived IS NULL")
+            params = ()
+            if pid:
+                total_sql += " AND project_id = ?"
+                params = (pid,)
+            total = con.execute(total_sql, params).fetchone()[0]
+            return mitems, total  # 只要一个计数，不必把所有会话载入一遍
         ui_state_clear()  # 会话没了：回列表
-    rows = load_sessions(con, pid)
-    for r in rows:
-        r["search"] = search_text(con, r)
+    rows = load_sessions(con, pid)  # r["search"] 已在其中批量生成
     items = []
     tw = row_title_width()
     if pid is not None:  # -p 指定单项目：不加分组头
@@ -1108,20 +1224,13 @@ def cmd_resume(ids, fork):
     row = find_row(con, sid)
     if not row:
         sys.exit(f"找不到会话: {sid}")
-    d = ""
-    for cand in (row["directory"], row["worktree"]):
-        if cand and os.path.isdir(cand):
-            d = cand
-            break
-    args = ["opencode", "--session", row["id"]]
-    if fork:
-        args.append("--fork")
+    d, args = resume_plan(dict(row), fork)
+    exe = opencode_exe()
     if IS_WIN:
-        exe = shutil.which("opencode") or "opencode"
         sys.exit(subprocess.run([exe] + args[1:], cwd=d or None).returncode)
     if d:
         os.chdir(d)
-    os.execvp("opencode", args)
+    os.execvp(exe, [exe] + args[1:])
 
 
 def cmd_copy(sid):
@@ -1232,12 +1341,8 @@ def main():
     ap.add_argument("--pid", metavar="PROJECT_ID", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
-    con = connect()
-
-    if args.show:
-        show_detail(con, args.show)
-        return
-
+    # 鼠标/视图状态类子命令不碰数据库（点击、右键、F8 每次都会走），
+    # 也不应因找不到 opencode.db 而失效
     if args.select_mouse:
         cmd_select_mouse()
         return
@@ -1256,6 +1361,12 @@ def main():
 
     if args.click is not None:
         cmd_click(args.click)
+        return
+
+    con = connect()
+
+    if args.show:
+        show_detail(con, args.show)
         return
 
     if args.resume is not None:

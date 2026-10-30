@@ -26,7 +26,7 @@ ocs 把它变成 ZCode 那样的体验：
 | 依赖 | 说明 |
 |---|---|
 | Python 3.8+ | 只用标准库，无 pip 依赖 |
-| [fzf](https://github.com/junegunn/fzf) ≥ 0.44 | 交互界面（`execute`/`reload`/`--track` 等特性） |
+| [fzf](https://github.com/junegunn/fzf) ≥ 0.68 | 交互界面（`--wrap=word` 0.68 起才有；另用到 `--info-command`、`execute`/`reload`/`--track`） |
 | [opencode](https://github.com/sst/opencode) | 数据来源（需要已经用过它，存在 `~/.local/share/opencode/opencode.db`） |
 | 终端 | 任何现代终端可用；**Konsole** 下鼠标与复制体验最完整（见下方说明） |
 
