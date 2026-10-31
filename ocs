@@ -1700,6 +1700,7 @@ def _run_picker(con, under, dry, tool):
         "--prompt=会话❯ ",
         "--info=inline-right:",   # 计数自绘（见 _FZF_INFO_CMD），放提示行最右侧
         "--no-separator",         # 不要横贯提示行的 ─── 分隔线
+        "--no-scrollbar",         # 列表侧滚动条紧贴 border 会看成两条竖线（fzf 默认开）
         "--info-command=" + _FZF_INFO_CMD,
         f"--header={header}",
         "--color=prompt:blue,pointer:blue,header:dim",
