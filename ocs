@@ -1,53 +1,12 @@
 #!/usr/bin/env python3
-r"""ocs — opencode 会话选择器（ZCode 风格）。
+r"""ocs — opencode / claude code / codex 的历史会话选择器（ZCode 风格）。
 
-像 ZCode 一样浏览和管理 opencode 历史会话：按项目分组、模糊搜索（含会话内容）、
-右侧预览、回车继续；支持对话视图（收起/展开 AI 回答）、重命名、批量删除。
+单文件 Python + fzf，零第三方依赖。单工具视图浏览三家 CLI 的历史会话，
+模糊搜索（含会话内容）、右侧实时预览、回车继续、对话视图、重命名、批量删除；
+点列表顶部的工具行切换工具，装了哪家显示哪家。完整键位与命令行用法：ocs -h
 
-═══ 使用教程 ═══════════════════════════════════════════════════════════
-
-【一】打开与浏览
-  ocs                    在终端里打开会话列表（所有项目，按项目分组）
-  打字                   过滤，可搜标题和会话里聊过的内容
-  ↑ / ↓                  上下选择，右侧实时预览详情
-  回车                   继续选中的会话；退出 opencode 后自动回到列表
-  双击                   同样=继续
-  滚轮                   浏览列表
-
-【二】对话视图（看聊天记录）
-  按 →                   打开当前会话的对话视图（列表换成消息列表）
-  ←                      返回会话列表
-  默认状态               只显示你提过的问题（一条一行）
-  点击某条提问 / 按 →    展开这条提问对应的 AI 回答（回答太长会自动折行）
-  再点击 / 再按 →        收起该条 AI 回答
-  右侧预览               显示光标所在那一条的完整问答
-
-【三】复制文字（Linux 终端）
-  右键一次（或 F8）      把鼠标交给终端，之后：
-                          · 按住拖动   = 选中文字（不用按 Shift）
-                          · 右键       = 直接弹出「复制」菜单
-  按 F8                  切回点击模式（平时：箭头光标、可点会话）
-  ctrl-y                 一键复制当前会话的 ID
-
-  （Windows 下直接用鼠标拖动选中，再右键即「复制」，无需 F8；ctrl-y 同样可用）
-
-【四】会话管理
-  ctrl-r                 重命名会话
-  ctrl-d                 删除：光标在会话=删该条；在项目分组行=删整组；
-                         tab 多选（可 ctrl-a 全选）后按=批量删
-  ctrl-e                 分叉继续（复制一份会话来聊，不影响原会话）
-  tab / ctrl-a           多选 / 全选      esc           退出
-
-【五】命令行
-  ocs -p /path/项目      只看指定项目
-  ocs --last [N]         直接继续最近第 N 个会话
-  ocs --show ID          查看详情（m:<会话ID>:<序号> 看单条消息）
-  ocs --delete ID...     删除会话（支持 id 前缀、多个，删除前确认）
-  ocs -l                 纯文本列表（适合管道/脚本）
-
-依赖: python3、fzf　|　数据: opencode（~/.local/share/opencode/opencode.db）、
-      claude code（~/.claude）、codex（~/.codex）——装了哪家就显示哪家，可混排
-Windows: 用 PowerShell 运行同目录的 ocs.ps1（数据在 %USERPROFILE%\.local\share\opencode\opencode.db）
+平台: Linux / macOS / Windows（Windows 用同目录的 ocs.ps1 运行，终端自带
+拖选复制，无需 F8）
 """
 import argparse
 import json
@@ -741,17 +700,11 @@ def build_search(texts, reply):
     return " ".join(parts)[:4000]
 
 
-def load_sessions(con, pid=None, directory=None):
+def load_sessions(con, pid=None):
     sql, params = SQL, []
     if pid:
         sql += " AND s.project_id = ?"
         params.append(pid)
-    if directory:  # 按运行目录分组键过滤，取值规则与 group_of 一致（worktree 在 project 表）
-        if directory == "?":
-            sql += " AND COALESCE(NULLIF(s.directory, ''), NULLIF(p.worktree, '')) IS NULL"
-        else:
-            sql += " AND COALESCE(NULLIF(s.directory, ''), NULLIF(p.worktree, '')) = ?"
-            params.append(directory)
     rows = [dict(r) for r in con.execute(sql, params)]
     counts = dict(con.execute("SELECT session_id, COUNT(*) FROM message GROUP BY session_id"))
     sids = [r["id"] for r in rows]
@@ -783,24 +736,8 @@ def ensure_title(con, r):
 
 
 def first_user_texts(con, sid, limit=None):
-    """用户消息文本，时间正序。limit=None 取全部。"""
-    sql = """SELECT p2.data FROM message m JOIN part p2 ON p2.message_id = m.id
-             WHERE m.session_id = ? AND json_extract(m.data, '$.role') = 'user'
-               AND json_extract(p2.data, '$.type') = 'text'
-             ORDER BY m.time_created, p2.id"""
-    params = [sid]
-    if limit:
-        sql += " LIMIT ?"
-        params.append(limit)
-    out = []
-    for r in con.execute(sql, params):
-        try:
-            t = clean_text(json.loads(r[0]).get("text", ""))
-        except (ValueError, AttributeError):
-            t = ""
-        if t:
-            out.append(t)
-    return out
+    """某会话的用户消息文本，时间正序（复用批量查询，避免第二份 SQL）。"""
+    return batch_user_texts(con, [sid], limit or 60).get(sid, [])
 
 
 def model_of(con, r):
@@ -1454,19 +1391,28 @@ def kill_fzf():
         pid = ppid
 
 
+def _launch(tool, argv, d):
+    """在会话目录里启动对应 CLI：POSIX 下 execvp 替换进程，Windows 下等退出。"""
+    exe = shutil.which(argv[0])
+    if not exe:
+        sys.exit(f"未找到 {argv[0]} 命令：请先安装 {ADAPTERS[tool]['name']} 并加入 PATH")
+    if IS_WIN:
+        sys.exit(subprocess.run([exe] + argv[1:], cwd=d or None).returncode)
+    if d:
+        os.chdir(d)
+    os.execvp(exe, [exe] + argv[1:])
+
+
 def run_resume(row, fork, dry):
-    """启动对应 CLI 续接会话。dry=True 只打印命令。返回退出码。"""
+    """--last 的续接：dry=True 只打印命令；否则启动后进程即被替换。"""
     argv = resume_cmd(row["tool"], row["id"], fork)
     d = cwd_of(row)
     if dry:
         print((f"cd {shlex.quote(d)} && " if d else "") + shlex.join(argv))
         return 0
-    exe = shutil.which(argv[0])
-    if not exe:
-        sys.exit(f"未找到 {argv[0]} 命令：请先安装 {ADAPTERS[row['tool']]['name']} 并加入 PATH")
     t = trunc(row["title"], 50)
     print(D(f"▸ 继续会话: {t} ({rel_time(row['time_updated'])}) — {argv[0]} 退出后回到列表"))
-    return subprocess.run([exe] + argv[1:], cwd=d or None).returncode
+    _launch(row["tool"], argv, d)
 
 
 def delete_sessions(targets):
@@ -1790,15 +1736,7 @@ def cmd_resume(ids, fork):
         print(D(f"（{ADAPTERS[tool]['name']} 会话暂不支持分叉，按原会话继续）"))
         fork = False
     argv = resume_cmd(tool, row["id"], fork)
-    exe = shutil.which(argv[0])
-    if not exe:
-        sys.exit(f"未找到 {argv[0]} 命令：请先安装 {ADAPTERS[tool]['name']} 并加入 PATH")
-    d = cwd_of(row)
-    if IS_WIN:
-        sys.exit(subprocess.run([exe] + argv[1:], cwd=d or None).returncode)
-    if d:
-        os.chdir(d)
-    os.execvp(exe, [exe] + argv[1:])
+    _launch(tool, argv, cwd_of(row))
 
 
 def cmd_copy(key):
@@ -1888,8 +1826,6 @@ def main():
     ocs -l                  纯文本列表（适合管道/脚本）
 """,
     )
-    ap.add_argument("-a", "--all", action="store_true",
-                    help="（默认即是全部项目分组，此参数为兼容保留）")
     ap.add_argument("-p", "--project", metavar="DIR", help="只看指定目录（含其子目录）的会话")
     ap.add_argument("-l", "--list", action="store_true",
                     help="列表模式输出（非交互，适合管道）")
@@ -1913,7 +1849,6 @@ def main():
     ap.add_argument("--dels", nargs="+", metavar="TOKEN", help=argparse.SUPPRESS)
     ap.add_argument("--fzf-lines", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--under", metavar="DIR", help=argparse.SUPPRESS)
-    ap.add_argument("--pick-tool", metavar="TOOL", help=argparse.SUPPRESS)
     ap.add_argument("--tool", metavar="TOOL", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
@@ -1937,11 +1872,6 @@ def main():
 
     if args.click is not None:
         cmd_click(args.click)
-        return
-
-    if args.pick_tool:  # 1/2/3 切换工具：只写状态文件，不碰数据库
-        if args.pick_tool in ADAPTERS:
-            set_tool(args.pick_tool)
         return
 
     # opencode 没装/没用过时仍可只看 claude code / codex；三家全缺才报错
