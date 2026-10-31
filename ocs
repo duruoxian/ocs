@@ -1792,7 +1792,8 @@ def main():
     ap = argparse.ArgumentParser(
         prog="ocs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="opencode 会话选择器（ZCode 风格）：按项目分组浏览历史会话，"
+        description="Open Coding Sessions——opencode / claude code / codex 会话选择器："
+                    "单工具视图浏览三家历史会话，点工具行切换；搜索含会话内容，"
                     "回车切回、可重命名、可批量删除。",
         epilog="""\
 使用教程:
