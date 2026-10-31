@@ -307,6 +307,10 @@ def BT(s):  # 会话名真彩中性 #c6c6cc（加粗条目在其主题下落 Bre
     return f"\x1b[38;2;198;198;204m{s}\x1b[0m"
 
 
+def DG(s):  # 更暗的真彩灰 #565B60（提示行的分隔点，与文字拉开层次）
+    return f"\x1b[38;2;86;91;96m{s}\x1b[0m"
+
+
 # ---------- 基础工具 ----------
 
 def db_path(required=True):
@@ -1651,6 +1655,13 @@ def _tool_sig():
         return None
 
 
+def _hint(segs):
+    """键位提示行：键名亮白、说明灰、分隔点更暗——点点不再和文字一个样。"""
+    return DG(" · ").join(
+        BT(k) + (HG(" " + v) if v else "") for k, v in segs
+    )
+
+
 def picker(con, under, dry):
     """单工具视图：header 只画当前一家的 Logo，列表只载这一家的会话；
     点击列表顶部工具行切换 = 写状态文件 + 让 fzf 退出 → 外层以新工具重启
@@ -1676,18 +1687,21 @@ def _run_picker(con, under, dry, tool):
             print(repr(l))
         return
     items, _ = build_fzf_items(con, under, tool)
-    copy_hint = (
-        "复制: ctrl-y 复制会话 ID · 鼠标按住拖动选中 · 右键「复制」"
-        if IS_WIN else
-        "复制: 右键/F8 交鼠标给终端 → 拖动选中 · 右键「复制」; F8 切回"
-    )
+    if IS_WIN:
+        copy_hint = _hint([("ctrl-y", "复制会话 ID"), ("拖动", "选中文字，右键「复制」")])
+    else:
+        copy_hint = _hint([("右键/F8", "交鼠标给终端：拖动选中、右键「复制」"),
+                           ("F8", "切回点击模式")])
     header = (
         "\n".join(tool_logo_lines(tool))
         + "\n" + HG("GitHub github.com/duruoxian   博客 duruoxian-blog.pages.dev")
-        + "\n" + D("浏览: 打字过滤（含聊天内容） · ↑↓ 选择 · 回车 继续 · 点击工具行切换")
-        + "\n" + D("视图: → 对话视图 · ← 返回 · 点击消息行 = 展开/收起 AI 回答")
-        + "\n" + D("管理: ctrl-r 重命名 · ctrl-d 删除（组头=整组 · tab 多选） · esc 退出")
-        + "\n" + D(copy_hint)
+        + "\n" + _hint([("打字", "过滤（含聊天内容）"), ("↑↓", "选择"), ("回车", "继续"),
+                        ("点击工具行", "切换")])
+        + "\n" + _hint([("→", "对话视图"), ("←", "返回"),
+                        ("点击消息行", "展开/收起 AI 回答")])
+        + "\n" + _hint([("ctrl-r", "重命名"), ("ctrl-d", "删除（组头=整组，tab 多选）"),
+                        ("esc", "退出")])
+        + "\n" + copy_hint
     )
     # 所有操作通过 execute 在界面内完成，reload 刷新列表；esc 才退出
     reload_cmd = (script + f" --fzf-lines --tool {q(tool)}"
