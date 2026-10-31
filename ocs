@@ -206,6 +206,77 @@ def logo_lines():
     ]
 
 
+# ── claude / codex 官方 mark（数据烘焙自 logo-assets/*.txt，源为 Wikimedia 官方品牌 SVG）──
+# 16×16 像素网格：'#'=mark 色、'.'=透明（露终端底色）；渲染成 8 行半块字符画
+_CLAUDE_GRID = (
+    "....##...#......",
+    "....##..##......",
+    "....##..##..##..",
+    ".##..##.##.###..",
+    "..##..#.#.###...",
+    "...#########....",
+    ".....######..###",
+    "####.##########.",
+    ".############...",
+    ".....###########",
+    "...#########....",
+    "..##..#.#####...",
+    ".....#.##.##.#..",
+    "....#..##..#....",
+    "....#..#...#....",
+    ".......#........",
+)
+_OPENAI_GRID = (
+    ".....####.......",
+    "....##..#####...",
+    "...##...##..##..",
+    "..##..##.....##.",
+    ".#.#.##..###..#.",
+    "#..#.#.##..####.",
+    "#..#.##..#...##.",
+    "#..#......##..##",
+    "##..##......#..#",
+    ".##...#..#..#..#",
+    ".####..##.#.#..#",
+    ".#..###..##.#.#.",
+    ".##.....##..##..",
+    "..##..##...##...",
+    "...#####..##....",
+    ".......####.....",
+)
+_CLAUDE_RGB = (217, 119, 87)   # 官方珊瑚 #D97757
+_OPENAI_RGB = (238, 238, 238)  # 终端上用白
+
+
+def _mark_lines(grid, rgb):
+    """像素网格 → 8 行半块字符画（前景=品牌色，无底色、随终端主题）。"""
+    fg = _rgb_fg(rgb)
+    out = []
+    for y in range(0, len(grid), 2):
+        row = []
+        for x in range(len(grid[y])):
+            t, b = grid[y][x], grid[y + 1][x]
+            if t == "#" and b == "#":
+                row.append(f"{fg}█{RESET}")
+            elif t == "#":
+                row.append(f"{fg}▀{RESET}")
+            elif b == "#":
+                row.append(f"{fg}▄{RESET}")
+            else:
+                row.append(" ")
+        out.append("".join(row))
+    return out
+
+
+def tool_logo_lines(tool):
+    """当前工具的门面 Logo：opencode=官方 4 行像素字，claude/codex=官方 mark 8 行。"""
+    if tool == "cc":
+        return _mark_lines(_CLAUDE_GRID, _CLAUDE_RGB)
+    if tool == "cx":
+        return _mark_lines(_OPENAI_GRID, _OPENAI_RGB)
+    return logo_lines()
+
+
 def C(s):   # 蓝色（部分主题会把 cyan 显示成刺眼的绿色，所以统一用 blue）
     return f"\x1b[34m{s}\x1b[0m"
 
@@ -220,6 +291,18 @@ def D(s):   # dim
 
 def B(s):   # bold
     return f"\x1b[1m{s}\x1b[0m"
+
+
+def A(s):   # 琥珀 #e0af68（分组行——用户反馈"目录和会话都是蓝色分不开"）
+    return f"\x1b[38;2;224;175;104m{s}\x1b[0m"
+
+
+def HG(s):  # 真彩灰 #82858A（dim 在用户 Konsole 主题下泛墨绿，显式真彩锁死）
+    return f"\x1b[38;2;130;133;138m{s}\x1b[0m"
+
+
+def BT(s):  # 会话名真彩中性 #c6c6cc（加粗条目在其主题下落 Breeze 蓝，与分组撞色）
+    return f"\x1b[38;2;198;198;204m{s}\x1b[0m"
 
 
 # ---------- 基础工具 ----------
@@ -312,6 +395,10 @@ def fmt_tok(n):
 
 
 def self_path():
+    try:  # 优先脚本真实路径：argv[0] 经 which 会解析到旧安装副本（开发/测试踩过）
+        return os.path.abspath(__main__.__file__)
+    except (AttributeError, NameError, OSError):
+        pass
     a0 = sys.argv[0]
     if os.path.sep in a0:
         return os.path.abspath(a0)
@@ -1000,16 +1087,20 @@ def _oc_con():
     return _oc_con_cache[0]
 
 
-def load_all(under=None):
-    """全部工具的会话行（时间倒序）。under 给定时只留该目录下的会话（含子目录）。"""
+def load_all(under=None, tool=None):
+    """会话行（时间倒序）。under 给定时只留该目录下（含子目录）的会话；
+    tool 给定时只载入那一家的数据（单工具视图）。"""
     rows = []
-    if db_path(required=False):
+    if tool in (None, "oc") and db_path(required=False):
         oc_rows = load_sessions(_oc_con())
         for r in oc_rows:  # oc 行也统一打上 tool/key，后面各层不再分叉
             r["tool"] = "oc"
             r["key"] = "oc:" + r["id"]
         rows += oc_rows
-    rows += cc_load() + cx_load()
+    if tool in (None, "cc"):
+        rows += cc_load()
+    if tool in (None, "cx"):
+        rows += cx_load()
     if under:
         rows = [r for r in rows if dir_match(r.get("directory"), under)]
     rows.sort(key=lambda r: r["time_updated"], reverse=True)
@@ -1066,6 +1157,54 @@ def cwd_of(row):
     return ""
 
 
+# ---------- 单工具视图：当前工具状态（123 切换、记住上次） ----------
+
+def tool_state_path():
+    if IS_WIN:
+        return os.path.join(_state_dir(), "tool-" + _tty_id())
+    return "/tmp/ocs-tool-" + _tty_id()
+
+
+def read_tool_file():
+    """状态文件里已保存的工具；没有/不合法返回 None。"""
+    try:
+        with open(tool_state_path()) as f:
+            t = f.read().strip()
+        return t if t in ADAPTERS else None
+    except OSError:
+        return None
+
+
+def default_tool():
+    """没有历史选择时默认哪一家：会话最多的（平局按 oc→cc→cx）。"""
+    counts = count_by_tool()
+    return max(("oc", "cc", "cx"), key=lambda t: counts[t])
+
+
+def current_tool():
+    return read_tool_file() or default_tool()
+
+
+def set_tool(tool):
+    try:
+        with open(tool_state_path(), "w") as f:
+            f.write(tool)
+    except OSError:
+        pass
+
+
+def count_by_tool():
+    """各工具会话数（轻量：oc 走 COUNT，cc/cx 数缓存行）。"""
+    n = {t: 0 for t in ADAPTERS}
+    if db_path(required=False):
+        n["oc"] = _oc_con().execute(
+            "SELECT COUNT(*) FROM session WHERE parent_id IS NULL AND time_archived IS NULL"
+        ).fetchone()[0]
+    n["cc"] = len(cc_load())
+    n["cx"] = len(cx_load())
+    return n
+
+
 def resume_cmd(tool, sid, fork):
     """续接命令的 argv（含命令名）。"""
     if tool == "oc":
@@ -1111,7 +1250,7 @@ def row_title_width():
 
 def fzf_line(r, tw, indent=""):
     """格式: 显示列 \t 会话键 \t 内容搜索文本（后两列隐藏，只参与搜索/预览取值）"""
-    disp = indent + B(pad(trunc(r["title"], tw), tw + 1))
+    disp = indent + BT(pad(trunc(r["title"], tw), tw + 1))
     disp += "  " + D(pad(rel_time(r["time_updated"]), 10))
     return disp + "\t" + r["key"] + "\t" + r.get("search", "")
 
@@ -1150,16 +1289,19 @@ def print_message_detail(mid):
     print(f"\n{M('AI │')}" + (a if a else D("（没有文本回答）")))
 
 
-def show_detail(con, sid):
+def show_detail(con, sid, tool=None):
     if parse_msg_id(sid):  # 消息行：显示该条完整问答
         return print_message_detail(sid)
     if sid == "@back":
         print(D("← 返回会话列表（按 ← 键，或点击本行）"))
         return
+    if sid == "@empty":
+        print(D("（该工具还没有会话）"))
+        return
     if sid.startswith("@ses:"):
         sid = sid[5:]
     elif sid.startswith("@"):  # 分组行：显示项目/目录汇总
-        return show_group_preview(con, sid[1:])
+        return show_group_preview(con, sid[1:], tool)
     r = find_session(sid)
     if not r:
         sys.exit(f"找不到会话: {sid}")
@@ -1198,8 +1340,8 @@ def show_detail(con, sid):
     print(f"\n{D('继续: ocs  |  ' + shlex.join(resume_cmd(r['tool'], r['id'], False)))}")
 
 
-def show_group_preview(con, key):
-    """分组行预览：key 为 p:<项目id> 或 d:<运行目录>。"""
+def show_group_preview(con, key, tool=None):
+    """分组行预览：key 为 p:<项目id> 或 d:<运行目录>。单工具视图下只统计该工具。"""
     if key.startswith("p:"):
         prow = con.execute(
             "SELECT id, worktree, name FROM project WHERE id = ?", (key[2:],)
@@ -1212,10 +1354,10 @@ def show_group_preview(con, key):
         path = prow["worktree"] or "?"
     else:
         d = key[2:]
-        rows = [r for r in load_all() if r["gkey"] == key]  # 目录组可跨工具混排
+        rows = [r for r in load_all(tool=tool) if r["gkey"] == key]  # 与当前视图同工具
         label = os.path.basename(d.rstrip("/")) or d
         path = d
-    print(B(C("◆ " + label)))
+    print(B(A("◆ " + label)))
     print(f"{D('路径')}   {path}")
     if not rows:
         print(D("（没有会话）"))
@@ -1238,7 +1380,7 @@ def print_list(rows):
         if r["gkey"] != cur:
             cur = r["gkey"]
             n = counts[r["gkey"]]
-            print(f"\n{B(C('◆ ' + r['glabel']))} {D('— ' + r['gpath'] + f' · {n} 个会话')}")
+            print(f"\n{B(A('◆ ' + r['glabel']))} {D('— ' + r['gpath'] + f' · {n} 个会话')}")
         line = "  " + B(pad(trunc(r["title"], 42), 44))
         line += "  " + D(pad(rel_time(r["time_updated"]), 10))
         line += "  " + D(f"{stats(r)}  {r['id'][:20]}…")
@@ -1401,28 +1543,25 @@ def build_msg_items(con, key):
     return items
 
 
-def count_all():
-    """轻量会话计数（不解析消息文本）：oc 走 SQL COUNT，cc/cx 数缓存行。"""
-    n = 0
-    if db_path(required=False):
-        n += _oc_con().execute(
-            "SELECT COUNT(*) FROM session WHERE parent_id IS NULL AND time_archived IS NULL"
-        ).fetchone()[0]
-    return n + len(cc_load()) + len(cx_load())
-
-
-def build_fzf_items(con, under):
+def build_fzf_items(con, under, tool):
     """按当前视图构造 fzf 列表行。返回 (items, 会话总数)。"""
     st = ui_state()
     if st.get("view") == "msg" and st.get("key"):
         mitems = build_msg_items(con, st["key"])
         if mitems is not None:
             # 只要一个计数，不必把所有会话的消息都载入一遍
-            return mitems, (len(load_all(under)) if under else count_all())
+            counts = count_by_tool()
+            total = (len(load_all(under, tool)) if under
+                     else (counts[tool] if tool else sum(counts.values())))
+            return mitems, total
         ui_state_clear()  # 会话没了：回列表
-    rows = load_all(under)  # r["search"] 已在其中生成
+    rows = load_all(under, tool)  # r["search"] 已在其中生成
     items = []
     tw = row_title_width()
+    if not rows:  # 该工具还没有会话（没装/没用过）：给占位行，进得来、不报错
+        items.append((D("（该工具还没有会话——在终端里用它聊一次，回来就能看到）"
+                        + "\t@empty\t"), None))
+        return items, 0
     if under is not None:  # -p 指定目录：不加分组头
         items += [(fzf_line(r, tw), r) for r in rows]
     else:
@@ -1435,7 +1574,7 @@ def build_fzf_items(con, under):
             name = trunc(first["glabel"], 16)
             tail = f" · {len(group)} 个会话"
             budget = max(8, pane - 5 - dw(name) - dw(tail))
-            head = (B(C("◆ " + name)) + "  "
+            head = (B(A("◆ " + name)) + "  "
                     + D(trunc(first["gpath"], budget) + tail))
             items.append((head + "\t@" + gkey + "\t", None))
             items += [(fzf_line(r, tw, indent="  "), r) for r in group]
@@ -1455,45 +1594,73 @@ _FZF_INFO_CMD = (
 )
 
 
+def facade_lines(tool, counts):
+    """门面（画在 fzf 之上）：当前工具 Logo + 站点行 + 工具切换行（1/2/3）。"""
+    lines = tool_logo_lines(tool)
+    lines.append(HG("GitHub github.com/duruoxian   博客 duruoxian-blog.pages.dev"))
+    seg = []
+    for i, t in enumerate(("oc", "cc", "cx"), 1):
+        label = f"{i} {ADAPTERS[t]['name']} {counts[t]}"
+        seg.append(B(C(label)) if t == tool else HG(label))
+    lines.append(HG("切换: ") + "  " + "  ".join(seg))
+    return lines
+
+
+def _tool_sig():
+    """工具状态文件签名（mtime+size）：区分 1/2/3 的 abort 与 esc 的 abort
+    （fzf 里两者退出码都是 130，只有按数字键才会写状态文件）。"""
+    try:
+        st = os.stat(tool_state_path())
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
 def picker(con, under, dry):
-    script = self_cmd()
+    """单工具视图：门面只画当前一家的 Logo，列表只载这一家的会话；
+    1/2/3 切换工具 = fzf abort 退出 → 外层重画门面重启（绝不运行中重绘 fzf）。"""
     try:
         os.unlink(mouse_state_path())  # 新会话从点击模式开始
     except OSError:
         pass
     ui_state_clear()  # 新会话从会话列表开始
+    while True:
+        tool = current_tool()
+        sig0 = _tool_sig()
+        again = _run_picker(con, under, dry, tool, count_by_tool())
+        if not again or _tool_sig() == sig0:  # esc（文件没动）= 真退出
+            return
+        write_tty("\x1b[H\x1b[2J")  # 清屏：下一次循环画新工具的门面
+
+
+def _run_picker(con, under, dry, tool, counts):
+    """跑一次 fzf。返回 True = 用户按了 1/2/3（fzf 已 abort 退出，需换门面重启）。"""
+    script = self_cmd()
     if dry:  # 调试：转储列表行
-        for l, _ in build_fzf_items(con, under)[0]:
+        for l, _ in build_fzf_items(con, under, tool)[0]:
             print(repr(l))
-        return
-    items, nrows = build_fzf_items(con, under)
-    if not items:
-        print("（没有会话了）")
-        return
-    if under:
-        label = "◆ " + (os.path.basename(under.rstrip("/\\")) or under)
-    else:
-        label = "◆ 全部来源"
+        return False
+    items, _ = build_fzf_items(con, under, tool)
+    facade = facade_lines(tool, counts)
+    nf = len(facade)
     copy_hint = (
         "复制: ctrl-y 复制会话 ID · 鼠标按住拖动选中 · 右键「复制」"
         if IS_WIN else
         "复制: 右键/F8 交鼠标给终端 → 拖动选中 · 右键「复制」; F8 切回"
     )
     header = (
-        "\n".join(logo_lines())
-        + "\n" + D("GitHub github.com/duruoxian   博客 duruoxian-blog.pages.dev")
-        + f"\n{label} · {nrows} 个会话\n"
-        + D("浏览: 打字过滤（含聊天内容） · ↑↓ 选择 · 回车 继续")
+        D("浏览: 打字过滤（含聊天内容） · ↑↓ 选择 · 回车 继续")
         + "\n" + D("视图: → 对话视图 · ← 返回 · 点击消息行 = 展开/收起 AI 回答")
         + "\n" + D("管理: ctrl-r 重命名 · ctrl-d 删除（组头=整组 · tab 多选） · esc 退出")
         + "\n" + D(copy_hint)
     )
     # 所有操作通过 execute 在界面内完成，reload 刷新列表；esc 才退出
-    reload_cmd = script + " --fzf-lines" + (f" --under {q(under)}" if under else "")
+    reload_cmd = (script + f" --fzf-lines --tool {q(tool)}"
+                  + (f" --under {q(under)}" if under else ""))
     cmd = [
         "fzf", "--ansi", "--layout=reverse", "--multi", "--marker=✓", "--wrap=word", "--track",
         "--delimiter=\t", "--with-nth=1",
-        f"--preview={script} --show {{2}}",
+        f"--preview={script} --show {{2}}" + (f" --tool {q(tool)}" if tool else ""),
         "--preview-window=right:50%:wrap:border-left",
         "--prompt=会话❯ ",
         "--info=inline-right:",   # 计数自绘（见 _FZF_INFO_CMD），放提示行最右侧
@@ -1501,7 +1668,11 @@ def picker(con, under, dry):
         "--info-command=" + _FZF_INFO_CMD,
         f"--header={header}",
         "--color=prompt:blue,pointer:blue,header:dim",
-        "--height=100%",
+        f"--height=-{nf}",        # 门面画在 fzf 之上，fzf 占其余全部（resize 自动适配）
+        # 1/2/3 切换工具：写状态文件后 abort（execute-silent 同步完成，写完才退出）
+        f"--bind=1:execute-silent({script} --pick-tool oc)+abort",
+        f"--bind=2:execute-silent({script} --pick-tool cc)+abort",
+        f"--bind=3:execute-silent({script} --pick-tool cx)+abort",
         f"--bind=enter:execute({script} --resume {{2}})+reload({reload_cmd})",
         f"--bind=ctrl-e:execute({script} --fork --resume {{2}})+reload({reload_cmd})",
         f"--bind=ctrl-y:execute-silent({script} --copy {{2}})",
@@ -1521,12 +1692,17 @@ def picker(con, under, dry):
         ]
     # Ctrl+C 交给终端（选中文字时复制）；在 ocs 内不响应，避免误退出
     cmd.append("--bind=ctrl-c:ignore")
+    sys.stdout.write("\n".join(facade) + "\n")
+    sys.stdout.flush()
+    rc = 0
     try:
-        subprocess.run(cmd, input="\n".join(l for l, _ in items), text=True,
-                       encoding="utf-8", errors="replace")
+        rc = subprocess.run(cmd, input="\n".join(l for l, _ in items), text=True,
+                            encoding="utf-8", errors="replace").returncode
     except FileNotFoundError:
         sys.exit("需要 fzf：请先安装（Windows: winget install junegunn.fzf；"
                  "Linux: pacman -S fzf），或改用 ocs -l 列表模式")
+    write_tty("\x1b[1;1H\x1b[J")  # 擦掉门面（切换=下一轮重画；退出=还用户干净屏幕）
+    return rc == 130  # 130 = 1/2/3 的 abort（esc=0）
 
 
 def cmd_resume(ids, fork):
@@ -1575,15 +1751,16 @@ def cmd_copy(key):
             time.sleep(0.1)  # 等 wl-copy 完成剪贴板登记，避免 ocs 退出太快丢失
 
 
-def cmd_del(tokens):
-    """删除处理：oc:/cc:/cx: 为会话；@ 开头为分组（= 该组全部会话）；其余碎片忽略。"""
+def cmd_del(tokens, tool=None):
+    """删除处理：oc:/cc:/cx: 为会话；@ 开头为分组（= 该组全部会话）；其余碎片忽略。
+    单工具视图下组只展开该工具的会话（用户看不到别家的行，就不能删到别家）。"""
     targets = {}
     for t in tokens:
         if t.startswith("@"):
             key = t[1:]
             if key.startswith("ses:"):  # 对话视图标题行：不删
                 continue
-            for r in load_all():
+            for r in load_all(tool=tool):
                 if r["gkey"] == key:
                     targets[r["key"]] = r
         else:
@@ -1596,15 +1773,19 @@ def cmd_del(tokens):
     delete_sessions(ordered)
 
 
-def cmd_fzf_lines(under):
+def cmd_fzf_lines(under, tool):
     con = _oc_con() if db_path(required=False) else None
-    for l, _ in build_fzf_items(con, under)[0]:
+    for l, _ in build_fzf_items(con, under, tool)[0]:
         print(l)
 
 
 # ---------- 入口 ----------
 
 def main():
+    if not IS_WIN:  # reload/execute 子进程在后台进程组，tty 访问会被停死（spinner 永转假死）
+        import signal
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
     ap = argparse.ArgumentParser(
         prog="ocs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1667,6 +1848,8 @@ def main():
     ap.add_argument("--dels", nargs="+", metavar="TOKEN", help=argparse.SUPPRESS)
     ap.add_argument("--fzf-lines", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--under", metavar="DIR", help=argparse.SUPPRESS)
+    ap.add_argument("--pick-tool", metavar="TOOL", help=argparse.SUPPRESS)
+    ap.add_argument("--tool", metavar="TOOL", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     # 鼠标/视图状态类子命令不碰数据库（点击、右键、F8 每次都会走），
@@ -1691,6 +1874,11 @@ def main():
         cmd_click(args.click)
         return
 
+    if args.pick_tool:  # 1/2/3 切换工具：只写状态文件，不碰数据库
+        if args.pick_tool in ADAPTERS:
+            set_tool(args.pick_tool)
+        return
+
     # opencode 没装/没用过时仍可只看 claude code / codex；三家全缺才报错
     con = None
     if db_path(required=False):
@@ -1701,7 +1889,7 @@ def main():
                  "（opencode 数据应在 ~/.local/share/opencode/opencode.db）")
 
     if args.show:
-        show_detail(con, args.show)
+        show_detail(con, args.show, args.tool)
         return
 
     if args.resume is not None:
@@ -1721,11 +1909,11 @@ def main():
         return
 
     if args.dels is not None:
-        cmd_del(args.dels)
+        cmd_del(args.dels, args.tool)
         return
 
     if args.fzf_lines:
-        cmd_fzf_lines(args.under)
+        cmd_fzf_lines(args.under, args.tool)
         return
 
     if args.delete:
