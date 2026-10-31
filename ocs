@@ -1704,8 +1704,8 @@ def _run_picker(con, under, dry, tool):
         + "\n" + copy_hint
     )
     # 所有操作通过 execute 在界面内完成，reload 刷新列表；esc 才退出
-    reload_cmd = (script + f" --fzf-lines --tool {q(tool)}"
-                  + (f" --under {q(under)}" if under else ""))
+    # （reload 不带 --tool：--fzf-lines 跟随工具状态文件，Windows 下点工具行也即时生效）
+    reload_cmd = script + " --fzf-lines" + (f" --under {q(under)}" if under else "")
     cmd = [
         "fzf", "--ansi", "--layout=reverse", "--multi", "--marker=✓", "--wrap=word", "--track",
         "--delimiter=\t", "--with-nth=1",
@@ -1821,6 +1821,8 @@ def cmd_del(tokens, tool=None):
 
 
 def cmd_fzf_lines(under, tool):
+    if not tool:  # reload 不带 --tool 时跟随状态文件：Windows 下点工具行
+        tool = current_tool()  # （fzf 不退出，靠 reload）也能立刻换成新工具的列表
     con = _oc_con() if db_path(required=False) else None
     for l, _ in build_fzf_items(con, under, tool)[0]:
         print(l)
