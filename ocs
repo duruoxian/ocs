@@ -56,6 +56,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -269,12 +270,13 @@ def _mark_lines(grid, rgb):
 
 
 def tool_logo_lines(tool):
-    """当前工具的门面 Logo：opencode=官方 4 行像素字，claude/codex=官方 mark 8 行。"""
+    """当前工具的门面 Logo，统一 8 行高（opencode 顶部补空行），
+    三家切换时站点行位置不上下晃。"""
     if tool == "cc":
         return _mark_lines(_CLAUDE_GRID, _CLAUDE_RGB)
     if tool == "cx":
         return _mark_lines(_OPENAI_GRID, _OPENAI_RGB)
-    return logo_lines()
+    return [""] * 4 + logo_lines()
 
 
 def C(s):   # 蓝色（部分主题会把 cyan 显示成刺眼的绿色，所以统一用 blue）
@@ -564,7 +566,13 @@ def cmd_nav_left(mid):
 
 
 def cmd_click(mid):
-    """单击：返回行=回到列表；消息行=展开/折叠；其他行不做任何事。"""
+    """单击：工具行=切换工具；返回行=回到列表；消息行=展开/折叠；其他行不做事。"""
+    if mid.startswith("@tool:"):
+        t = mid[6:]
+        if t in ADAPTERS:
+            set_tool(t)
+            kill_fzf()  # 让 fzf 退出 → 外层以新工具重启（header/列表一起换）
+        return
     if mid == "@back":
         return cmd_nav_left(mid)
     toggle_msg(mid)
@@ -1353,6 +1361,9 @@ def show_group_preview(con, key, tool=None):
         label = prow["name"] or os.path.basename((prow["worktree"] or "?").rstrip("/")) or prow["worktree"]
         path = prow["worktree"] or "?"
     else:
+        if key.startswith("tool:"):  # 工具行：预览给一句提示
+            print(D("（点击/回车本行切换到该工具视图）"))
+            return
         d = key[2:]
         rows = [r for r in load_all(tool=tool) if r["gkey"] == key]  # 与当前视图同工具
         label = os.path.basename(d.rstrip("/")) or d
@@ -1396,6 +1407,37 @@ def opencode_exe():
     if not exe:
         sys.exit("未找到 opencode 命令：请先安装 opencode 并加入 PATH")
     return exe
+
+
+def _ppid_of(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def kill_fzf():
+    """fzf execute 子进程里向上找到 fzf 并终止它（点工具行切换时用）：
+    ocs 外层随后检测到工具状态文件变化，以新工具重启 picker。"""
+    if IS_WIN:  # Windows 下退化为「列表已切换、重启后 logo 生效」
+        return
+    pid = os.getppid()
+    for _ in range(4):
+        if not pid or pid <= 1:
+            return
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                name = f.read().strip()
+        except OSError:
+            return
+        if name == "fzf":
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            return
+        pid = _ppid_of(pid)
 
 
 def run_resume(row, fork, dry):
@@ -1543,20 +1585,26 @@ def build_msg_items(con, key):
     return items
 
 
-def build_fzf_items(con, under, tool):
+def build_fzf_items(con, under, tool, counts=None):
     """按当前视图构造 fzf 列表行。返回 (items, 会话总数)。"""
     st = ui_state()
+    counts = counts or count_by_tool()
+    items = []
+    if st.get("view") != "msg":
+        # 列表顶部 3 行工具行：点击/回车切换视图工具（不占数字键，搜索不受影响）
+        for t in ("oc", "cc", "cx"):
+            label = f"{ADAPTERS[t]['name']}  {counts[t]}"
+            disp = (B(C("▸ " + label)) if t == tool else HG("  " + label))
+            items.append((disp + "\t@tool:" + t + "\t", None))
     if st.get("view") == "msg" and st.get("key"):
         mitems = build_msg_items(con, st["key"])
         if mitems is not None:
             # 只要一个计数，不必把所有会话的消息都载入一遍
-            counts = count_by_tool()
             total = (len(load_all(under, tool)) if under
                      else (counts[tool] if tool else sum(counts.values())))
-            return mitems, total
+            return items + mitems, total
         ui_state_clear()  # 会话没了：回列表
     rows = load_all(under, tool)  # r["search"] 已在其中生成
-    items = []
     tw = row_title_width()
     if not rows:  # 该工具还没有会话（没装/没用过）：给占位行，进得来、不报错
         items.append((D("（该工具还没有会话——在终端里用它聊一次，回来就能看到）"
@@ -1594,21 +1642,9 @@ _FZF_INFO_CMD = (
 )
 
 
-def facade_lines(tool, counts):
-    """门面（画在 fzf 之上）：当前工具 Logo + 站点行 + 工具切换行（1/2/3）。"""
-    lines = tool_logo_lines(tool)
-    lines.append(HG("GitHub github.com/duruoxian   博客 duruoxian-blog.pages.dev"))
-    seg = []
-    for i, t in enumerate(("oc", "cc", "cx"), 1):
-        label = f"{i} {ADAPTERS[t]['name']} {counts[t]}"
-        seg.append(B(C(label)) if t == tool else HG(label))
-    lines.append(HG("切换: ") + "  " + "  ".join(seg))
-    return lines
-
-
 def _tool_sig():
-    """工具状态文件签名（mtime+size）：区分 1/2/3 的 abort 与 esc 的 abort
-    （fzf 里两者退出码都是 130，只有按数字键才会写状态文件）。"""
+    """工具状态文件签名（mtime+size）：区分「点了工具行」与「esc」
+    （两者都让 fzf 退出，只有点工具行才会写状态文件）。"""
     try:
         st = os.stat(tool_state_path())
         return (st.st_mtime_ns, st.st_size)
@@ -1617,8 +1653,9 @@ def _tool_sig():
 
 
 def picker(con, under, dry):
-    """单工具视图：门面只画当前一家的 Logo，列表只载这一家的会话；
-    1/2/3 切换工具 = fzf abort 退出 → 外层重画门面重启（绝不运行中重绘 fzf）。"""
+    """单工具视图：header 只画当前一家的 Logo，列表只载这一家的会话；
+    点击列表顶部工具行切换 = 写状态文件 + 让 fzf 退出 → 外层以新工具重启
+    （header 随之重画；ocs 绝不向 fzf 外打印任何行，esc 退出后终端原样）。"""
     try:
         os.unlink(mouse_state_path())  # 新会话从点击模式开始
     except OSError:
@@ -1627,29 +1664,28 @@ def picker(con, under, dry):
     while True:
         tool = current_tool()
         sig0 = _tool_sig()
-        again = _run_picker(con, under, dry, tool, count_by_tool())
-        if not again or _tool_sig() == sig0:  # esc（文件没动）= 真退出
+        _run_picker(con, under, dry, tool)
+        if _tool_sig() == sig0:  # esc（文件没动）= 真退出
             return
-        write_tty("\x1b[H\x1b[2J")  # 清屏：下一次循环画新工具的门面
 
 
-def _run_picker(con, under, dry, tool, counts):
-    """跑一次 fzf。返回 True = 用户按了 1/2/3（fzf 已 abort 退出，需换门面重启）。"""
+def _run_picker(con, under, dry, tool):
+    """跑一次 fzf；fzf 退出后由外层比较工具状态文件签名决定重启还是退出。"""
     script = self_cmd()
     if dry:  # 调试：转储列表行
         for l, _ in build_fzf_items(con, under, tool)[0]:
             print(repr(l))
-        return False
+        return
     items, _ = build_fzf_items(con, under, tool)
-    facade = facade_lines(tool, counts)
-    nf = len(facade)
     copy_hint = (
         "复制: ctrl-y 复制会话 ID · 鼠标按住拖动选中 · 右键「复制」"
         if IS_WIN else
         "复制: 右键/F8 交鼠标给终端 → 拖动选中 · 右键「复制」; F8 切回"
     )
     header = (
-        D("浏览: 打字过滤（含聊天内容） · ↑↓ 选择 · 回车 继续")
+        "\n".join(tool_logo_lines(tool))
+        + "\n" + HG("GitHub github.com/duruoxian   博客 duruoxian-blog.pages.dev")
+        + "\n" + D("浏览: 打字过滤（含聊天内容） · ↑↓ 选择 · 回车 继续 · 点击工具行切换")
         + "\n" + D("视图: → 对话视图 · ← 返回 · 点击消息行 = 展开/收起 AI 回答")
         + "\n" + D("管理: ctrl-r 重命名 · ctrl-d 删除（组头=整组 · tab 多选） · esc 退出")
         + "\n" + D(copy_hint)
@@ -1668,11 +1704,7 @@ def _run_picker(con, under, dry, tool, counts):
         "--info-command=" + _FZF_INFO_CMD,
         f"--header={header}",
         "--color=prompt:blue,pointer:blue,header:dim",
-        f"--height=-{nf}",        # 门面画在 fzf 之上，fzf 占其余全部（resize 自动适配）
-        # 1/2/3 切换工具：写状态文件后 abort（execute-silent 同步完成，写完才退出）
-        f"--bind=1:execute-silent({script} --pick-tool oc)+abort",
-        f"--bind=2:execute-silent({script} --pick-tool cc)+abort",
-        f"--bind=3:execute-silent({script} --pick-tool cx)+abort",
+        "--height=100%",          # 全屏：预览分隔线从顶贯穿到底，esc 退出终端原样恢复
         f"--bind=enter:execute({script} --resume {{2}})+reload({reload_cmd})",
         f"--bind=ctrl-e:execute({script} --fork --resume {{2}})+reload({reload_cmd})",
         f"--bind=ctrl-y:execute-silent({script} --copy {{2}})",
@@ -1692,17 +1724,12 @@ def _run_picker(con, under, dry, tool, counts):
         ]
     # Ctrl+C 交给终端（选中文字时复制）；在 ocs 内不响应，避免误退出
     cmd.append("--bind=ctrl-c:ignore")
-    sys.stdout.write("\n".join(facade) + "\n")
-    sys.stdout.flush()
-    rc = 0
     try:
-        rc = subprocess.run(cmd, input="\n".join(l for l, _ in items), text=True,
-                            encoding="utf-8", errors="replace").returncode
+        subprocess.run(cmd, input="\n".join(l for l, _ in items), text=True,
+                       encoding="utf-8", errors="replace")
     except FileNotFoundError:
         sys.exit("需要 fzf：请先安装（Windows: winget install junegunn.fzf；"
                  "Linux: pacman -S fzf），或改用 ocs -l 列表模式")
-    write_tty("\x1b[1;1H\x1b[J")  # 擦掉门面（切换=下一轮重画；退出=还用户干净屏幕）
-    return rc == 130  # 130 = 1/2/3 的 abort（esc=0）
 
 
 def cmd_resume(ids, fork):
@@ -1712,6 +1739,12 @@ def cmd_resume(ids, fork):
         return
     if key.startswith("@ses:"):
         key = key[5:]  # 对话视图的标题行：续接该会话
+    elif key.startswith("@tool:"):
+        t = key[6:]
+        if t in ADAPTERS:
+            set_tool(t)
+            kill_fzf()  # 回车在工具行上 = 同点击切换
+        return
     elif key.startswith("@"):
         return  # 分组/返回行：忽略
     pm = parse_msg_id(key)
