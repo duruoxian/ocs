@@ -45,7 +45,8 @@ r"""ocs — opencode 会话选择器（ZCode 风格）。
   ocs --delete ID...     删除会话（支持 id 前缀、多个，删除前确认）
   ocs -l                 纯文本列表（适合管道/脚本）
 
-依赖: python3、fzf　|　数据: ~/.local/share/opencode/opencode.db
+依赖: python3、fzf　|　数据: opencode（~/.local/share/opencode/opencode.db）、
+      claude code（~/.claude）、codex（~/.codex）——装了哪家就显示哪家，可混排
 Windows: 用 PowerShell 运行同目录的 ocs.ps1（数据在 %USERPROFILE%\.local\share\opencode\opencode.db）
 """
 import argparse
@@ -223,7 +224,7 @@ def B(s):   # bold
 
 # ---------- 基础工具 ----------
 
-def db_path():
+def db_path(required=True):
     cands = []
     if os.environ.get("OPENCODE_DATA"):
         cands.append(os.path.join(os.environ["OPENCODE_DATA"], "opencode.db"))
@@ -232,6 +233,8 @@ def db_path():
     for c in cands:
         if os.path.isfile(c):
             return c
+    if not required:  # 多工具模式：没装 opencode 也能只看 claude/codex
+        return None
     sys.exit("找不到 opencode 数据库，尝试过:\n  " + "\n  ".join(cands))
 
 
@@ -430,13 +433,16 @@ def ui_state_clear():
 
 
 def parse_msg_id(mid):
-    """消息行 id 形如 m:<session_id>:<序号>；不是消息行返回 None。"""
+    """消息行 id 形如 m:<tool>:<session_id>:<序号>；不是消息行返回 None。"""
     if not mid.startswith("m:"):
         return None
     parts = mid.split(":")
-    if len(parts) != 3 or not parts[2].isdigit():
+    if len(parts) != 4 or not parts[3].isdigit():
         return None
-    return parts[1], int(parts[2])
+    tool, sid = split_key(parts[1] + ":" + parts[2])
+    if tool is None:
+        return None
+    return tool, sid, int(parts[3])
 
 
 def toggle_msg(mid):
@@ -444,9 +450,9 @@ def toggle_msg(mid):
     pm = parse_msg_id(mid)
     if not pm:
         return
-    sid, idx = pm
+    tool, sid, idx = pm
     st = ui_state()
-    if st.get("view") != "msg" or st.get("sid") != sid:
+    if st.get("view") != "msg" or st.get("key") != tool + ":" + sid:
         return
     exp = set(st.get("expanded", []))
     exp.symmetric_difference_update({idx})
@@ -460,10 +466,9 @@ def cmd_nav_right(mid):
     if pm:
         toggle_msg(mid)
         return
-    if mid.startswith("ses"):
-        ui_state_set({"view": "msg", "sid": mid, "expanded": []})
-    elif mid.startswith("@ses:"):
-        ui_state_set({"view": "msg", "sid": mid[5:], "expanded": []})
+    key = mid[5:] if mid.startswith("@ses:") else (mid if split_key(mid)[0] else None)
+    if key:  # oc:ses_x / cc:uuid / cx:id → 打开该会话的对话视图
+        ui_state_set({"view": "msg", "key": key, "expanded": []})
 
 
 def cmd_nav_left(mid):
@@ -732,16 +737,6 @@ def proj_label(r):
     return os.path.basename(wt.rstrip("/\\")) or wt or "?"
 
 
-def project_dirs(con, pid):
-    ds = set()
-    prow = con.execute("SELECT worktree FROM project WHERE id = ?", (pid,)).fetchone()
-    if prow and prow[0]:
-        ds.add(prow[0])
-    for (d,) in con.execute("SELECT directory FROM project_directory WHERE project_id = ?", (pid,)):
-        ds.add(d)
-    return {d for d in ds if d}
-
-
 def dir_match(d, target):
     d = (d or "").replace("\\", "/").rstrip("/") or "/"
     t = (target or "").replace("\\", "/").rstrip("/") or "/"
@@ -750,20 +745,334 @@ def dir_match(d, target):
     return t == d or t.startswith(d.rstrip("/") + "/")
 
 
-def resolve_project(con, target):
-    target = os.path.abspath(os.path.expanduser(target))
-    tc = os.path.normcase(target)
-    projects = con.execute("SELECT id, worktree, name FROM project").fetchall()
-    for r in projects:
-        if r["worktree"] and os.path.normcase(os.path.abspath(r["worktree"])) == tc:
-            return r["id"]
-    for r in projects:
-        if any(dir_match(d, target) for d in project_dirs(con, r["id"])):
-            return r["id"]
-    sys.exit(
-        f"没有找到与 {target} 关联的项目。已知项目:\n"
-        + "\n".join(f"  {r['worktree']}  {r['name'] or ''}" for r in projects)
-    )
+# ---------- 多工具适配层 ----------
+# 三家 CLI 的会话统一成一种行结构，上层（列表/预览/动作）只认行不认工具：
+#   行字段: tool/id/key/title/directory/path/time_created/time_updated/msgs/
+#           tokens_input/output/reasoning/cost/model/search/gkey/glabel/gpath
+#   key = "<前缀>:<会话id>"（oc:ses_x · cc:uuid · cx:id），是 fzf 的隐藏字段 2
+# opencode 走 SQLite（复用上方查询函数）；claude code / codex 是 JSONL 文件，
+# mtime+size 没变就用缓存行（/tmp/ocs/filecache.json），坏文件/坏行跳过不拖垮列表。
+
+ADAPTERS = {
+    "oc": {"name": "opencode", "cmd": "opencode", "rename_ok": True, "fork_ok": True},
+    "cc": {"name": "claude code", "cmd": "claude", "rename_ok": False, "fork_ok": False},
+    "cx": {"name": "codex", "cmd": "codex", "rename_ok": False, "fork_ok": False},
+}
+
+
+def split_key(key):
+    """'cc:c1' → ('cc', 'c1')；无前缀视作 opencode（兼容旧的 ses_* 用法）。"""
+    key = key or ""
+    if ":" in key:
+        p, _, i = key.partition(":")
+        if p in ADAPTERS and i:
+            return p, i
+    if key.startswith("ses"):
+        return "oc", key
+    return None, key
+
+
+def ts_ms(s):
+    """ISO 8601 → 毫秒时间戳（与 opencode.db 的毫秒时间对齐；naive 视作本地时间）。"""
+    s = (s or "").strip()
+    if not s:
+        return 0
+    if s[-1] in "Zz":
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            dt = datetime.fromisoformat(s[:19])
+        except ValueError:
+            return 0
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return int(dt.timestamp() * 1000)
+
+
+def _pair_seq(seq):
+    """[(role, text)] 时间正序 → [(用户提问, AI 回答)]；语义与 message_pairs 一致。"""
+    pairs, pair = [], None
+    for role, text in seq:
+        if role == "user":
+            if pair:
+                pairs.append(pair)
+            pair = [text, ""]
+        elif role == "assistant" and pair is not None:
+            pair[1] = (pair[1] + "\n\n" + text).strip() if pair[1] else text
+    if pair:  # 最后一对问答同样要在这里补上（oc 版踩过的坑）
+        pairs.append(pair)
+    return pairs
+
+
+def _json_lines(path):
+    """逐行读 JSONL；坏行直接跳过（一个坏文件不该拖垮整个列表）。"""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _text_blocks(content):
+    """消息 content → 正文：字符串直接用；列表只取 text 块（tool_result 等跳过）。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [str(c.get("text") or "") for c in content
+                 if isinstance(c, dict) and c.get("type") in ("text", "input_text", "output_text")]
+        return "\n\n".join(p for p in parts if p.strip())
+    return ""
+
+
+def _save_json(path, obj):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _scan_rows(tool, root, parse_file):
+    """扫描 root 下全部 *.jsonl 生成会话行；mtime+size 未变的文件直接用缓存。"""
+    if not os.path.isdir(root):
+        return []
+    cache_path = os.path.join(_state_dir(), "filecache.json")
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    bucket, fresh, rows = cache.get(tool, {}), {}, []
+    for dirpath, _, files in os.walk(root):
+        for fn in sorted(files):
+            if not fn.endswith(".jsonl"):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            ent = bucket.get(path)
+            if ent and ent.get("m") == st.st_mtime and ent.get("s") == st.st_size:
+                fresh[path] = ent
+                rows.append(ent["row"])
+                continue
+            row = parse_file(path)
+            if row is not None:
+                ent = {"m": st.st_mtime, "s": st.st_size, "row": row}
+                fresh[path] = ent
+                rows.append(row)
+    if fresh != bucket:  # 有新增/失效才落盘（纯命中时不写）
+        cache[tool] = fresh
+        _save_json(cache_path, cache)
+    return rows
+
+
+def _cc_parse(path, seq_out=None):
+    """Claude Code 会话文件 → 行（无有效消息返回 None）。
+    seq_out 传列表时顺带写入 (role, text) 序列，供对话视图复用同一次解析。"""
+    seq, title, sid, cwd, model = [], "", "", "", ""
+    cost, msgs, tc, tu = 0.0, 0, 0, 0
+    for obj in _json_lines(path):
+        t = obj.get("type")
+        if t == "summary" and not title:
+            title = str(obj.get("summary") or "")
+            continue
+        if t not in ("user", "assistant") or obj.get("isSidechain"):
+            continue
+        msg = obj.get("message") or {}
+        role = msg.get("role")
+        body = _text_blocks(msg.get("content"))
+        ts = ts_ms(obj.get("timestamp"))
+        sid = sid or str(obj.get("sessionId") or "")
+        cwd = cwd or str(obj.get("cwd") or "")
+        tc = tc or ts
+        tu = max(tu, ts)
+        if role == "assistant":
+            model = str(msg.get("model") or "") or model
+            try:
+                cost += float(obj.get("costUSD") or 0)
+            except (TypeError, ValueError):
+                pass
+        msgs += 1
+        if body:
+            seq.append((role, body))
+    if seq_out is not None:
+        seq_out.extend(seq)
+    if not seq or not tu:
+        return None
+    texts = [b for r, b in seq if r == "user"]
+    reply = next((b for r, b in reversed(seq) if r == "assistant"), "")
+    return {
+        "tool": "cc", "id": sid or os.path.splitext(os.path.basename(path))[0],
+        "path": path, "directory": cwd, "title": title, "model": model,
+        "time_created": tc, "time_updated": tu, "msgs": msgs,
+        "npairs": len(_pair_seq(seq)), "cost": round(cost, 6),
+        "tokens_input": 0, "tokens_output": 0, "tokens_reasoning": 0,
+        "texts": texts, "_reply": reply,
+    }
+
+
+def _cx_parse(path, seq_out=None):
+    """Codex 会话文件（信封式 JSONL）→ 行（无有效消息返回 None）。seq_out 同 _cc_parse。"""
+    seq, sid, cwd, model = [], "", "", ""
+    ti = to = msgs = tc = tu = 0
+    for obj in _json_lines(path):
+        t, payload = obj.get("type"), (obj.get("payload") or {})
+        ts = ts_ms(obj.get("timestamp"))
+        if t == "session_meta":
+            sid = str(payload.get("id") or "")
+            cwd = str(payload.get("cwd") or "")
+            tc = tc or ts
+        elif t == "response_item" and payload.get("type") == "message":
+            role = payload.get("role")
+            body = _text_blocks(payload.get("content"))
+            if role in ("user", "assistant"):
+                msgs += 1
+                if body:
+                    seq.append((role, body))
+        elif t == "turn_context":
+            model = str(payload.get("model") or "") or model
+        elif t == "event_msg" and payload.get("type") == "token_count":
+            tot = ((payload.get("info") or {}).get("total_token_usage") or {})
+            ti = int(tot.get("input_tokens") or 0)
+            to = int(tot.get("output_tokens") or 0)
+        if ts:
+            tc = tc or ts
+            tu = max(tu, ts)
+    if seq_out is not None:
+        seq_out.extend(seq)
+    if not seq or not tu:
+        return None
+    texts = [b for r, b in seq if r == "user"]
+    reply = next((b for r, b in reversed(seq) if r == "assistant"), "")
+    return {
+        "tool": "cx", "id": sid or os.path.splitext(os.path.basename(path))[0],
+        "path": path, "directory": cwd, "title": "", "model": model,
+        "time_created": tc, "time_updated": tu, "msgs": msgs,
+        "npairs": len(_pair_seq(seq)), "cost": 0.0,
+        "tokens_input": ti, "tokens_output": to, "tokens_reasoning": 0,
+        "texts": texts, "_reply": reply,
+    }
+
+
+def cc_root():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def cx_root():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def _finalize_rows(prefix, rows):
+    for r in rows:
+        r["key"] = prefix + ":" + r["id"]
+        t = r["title"] or (trunc(r["texts"][0], 30) if r.get("texts") else "")
+        r["title"] = t or "(无标题)"
+        r["search"] = build_search(r.get("texts") or [], r.get("_reply") or "")
+        d = r["directory"] or "?"
+        r["gkey"], r["glabel"], r["gpath"] = "d:" + d, os.path.basename(d.rstrip("/\\")) or d, d
+    return rows
+
+
+def cc_load():
+    return _finalize_rows("cc", _scan_rows("cc", os.path.join(cc_root(), "projects"), _cc_parse))
+
+
+def cx_load():
+    return _finalize_rows("cx", _scan_rows("cx", os.path.join(cx_root(), "sessions"), _cx_parse))
+
+
+_oc_con_cache = []
+
+
+def _oc_con():
+    """opencode 数据库连接（本进程内懒加载、只此一份；只读）。"""
+    if not _oc_con_cache:
+        _oc_con_cache.append(connect())
+    return _oc_con_cache[0]
+
+
+def load_all(under=None):
+    """全部工具的会话行（时间倒序）。under 给定时只留该目录下的会话（含子目录）。"""
+    rows = []
+    if db_path(required=False):
+        oc_rows = load_sessions(_oc_con())
+        for r in oc_rows:  # oc 行也统一打上 tool/key，后面各层不再分叉
+            r["tool"] = "oc"
+            r["key"] = "oc:" + r["id"]
+        rows += oc_rows
+    rows += cc_load() + cx_load()
+    if under:
+        rows = [r for r in rows if dir_match(r.get("directory"), under)]
+    rows.sort(key=lambda r: r["time_updated"], reverse=True)
+    return rows
+
+
+def find_session(key):
+    """按 key 取会话行；找不到返回 None（oc 的前缀歧义会列出候选后退出）。"""
+    tool, sid = split_key(key)
+    if tool is None:
+        return None
+    if tool == "oc":
+        if not db_path(required=False):
+            return None
+        row = find_row(_oc_con(), sid)
+        if not row:
+            return None
+        r = dict(row)
+        r["tool"], r["key"] = "oc", "oc:" + r["id"]
+        return r
+    for r in (cc_load() if tool == "cc" else cx_load()):
+        if r["id"] == sid:
+            return r
+    return None
+
+
+def pairs_of(tool, sid, upto=None):
+    """某会话的问答对；与 oc 的 message_pairs 同语义（含 upto 凑够即停）。"""
+    if tool == "oc":
+        return message_pairs(_oc_con(), sid, upto)
+    row = find_session(tool + ":" + sid)
+    if not row:
+        return []
+    seq = []
+    (_cc_parse if tool == "cc" else _cx_parse)(row["path"], seq_out=seq)
+    pairs = _pair_seq(seq)
+    return pairs[:upto + 1] if upto is not None else pairs
+
+
+def texts_of(tool, sid, limit=20):
+    """用户提问文本（时间正序，前 limit 条）。"""
+    if tool == "oc":
+        if not db_path(required=False):
+            return []
+        return first_user_texts(_oc_con(), sid, limit)
+    row = find_session(tool + ":" + sid)
+    return (row.get("texts") or [])[:limit] if row else []
+
+
+def cwd_of(row):
+    for cand in (row.get("directory"), row.get("worktree")):
+        if cand and os.path.isdir(cand):
+            return cand
+    return ""
+
+
+def resume_cmd(tool, sid, fork):
+    """续接命令的 argv（含命令名）。"""
+    if tool == "oc":
+        return ["opencode", "--session", sid] + (["--fork"] if fork else [])
+    if tool == "cc":
+        return ["claude", "--resume", sid]
+    return ["codex", "resume", sid]
 
 
 # ---------- 展示 ----------
@@ -801,42 +1110,37 @@ def row_title_width():
 
 
 def fzf_line(r, tw, indent=""):
-    """格式: 显示列 \\t 会话id \\t 内容搜索文本（后两列隐藏，只参与搜索/预览取值）"""
+    """格式: 显示列 \t 会话键 \t 内容搜索文本（后两列隐藏，只参与搜索/预览取值）"""
     disp = indent + B(pad(trunc(r["title"], tw), tw + 1))
     disp += "  " + D(pad(rel_time(r["time_updated"]), 10))
-    return disp + "\t" + r["id"] + "\t" + r.get("search", "")
+    return disp + "\t" + r["key"] + "\t" + r.get("search", "")
 
 
-def print_history(con, sid):
+def print_history(tool, sid, has_reply):
     """会话预览里的历史消息：默认只显示用户提问，AI 回答在对话视图里点开。
 
     预览窗不可滚动，只列前 20 条；光标每动一次都重跑，避免拉全整个会话。
     """
-    texts = first_user_texts(con, sid, 20)
+    texts = texts_of(tool, sid, 20)
     print(f"\n{C('── 我提过的问题 ' + '─' * 20)}")
     if not texts:
         print(D("（没有文本消息）"))
         return
     for q in texts:
         print(C("•") + " " + trunc(q, 96))
-    has_reply = con.execute(
-        """SELECT 1 FROM message WHERE session_id = ?
-           AND json_extract(data, '$.role') = 'assistant' LIMIT 1""",
-        (sid,),
-    ).fetchone()
     if has_reply:
         print(D("（按 → 打开对话视图，点消息行可展开/收起 AI 回答）"))
     if len(texts) == 20:
         print(D("（长会话仅列前 20 条提问，按 → 看完整对话）"))
 
 
-def print_message_detail(con, mid):
+def print_message_detail(mid):
     """对话视图里某条消息的详情：完整显示提问与对应的 AI 回答。"""
     pm = parse_msg_id(mid)
     if not pm:
         return
-    sid, idx = pm
-    pairs = message_pairs(con, sid, upto=idx)  # 只要第 idx 对，凑够即停
+    tool, sid, idx = pm
+    pairs = pairs_of(tool, sid, upto=idx)  # 只要第 idx 对，凑够即停
     if idx >= len(pairs):
         print(D("（消息不存在）"))
         return
@@ -848,7 +1152,7 @@ def print_message_detail(con, mid):
 
 def show_detail(con, sid):
     if parse_msg_id(sid):  # 消息行：显示该条完整问答
-        return print_message_detail(con, sid)
+        return print_message_detail(sid)
     if sid == "@back":
         print(D("← 返回会话列表（按 ← 键，或点击本行）"))
         return
@@ -856,23 +1160,24 @@ def show_detail(con, sid):
         sid = sid[5:]
     elif sid.startswith("@"):  # 分组行：显示项目/目录汇总
         return show_group_preview(con, sid[1:])
-    row = find_row(con, sid)
-    if not row:
+    r = find_session(sid)
+    if not r:
         sys.exit(f"找不到会话: {sid}")
-    r = dict(row)
-    r["msgs"] = con.execute(
-        "SELECT COUNT(*) FROM message WHERE session_id = ?", (r["id"],)
-    ).fetchone()[0]
-    ensure_title(con, r)
+    if r["tool"] == "oc":
+        ensure_title(con, r)
+        r["msgs"] = con.execute(
+            "SELECT COUNT(*) FROM message WHERE session_id = ?", (r["id"],)
+        ).fetchone()[0]
+        r["gkey"], r["glabel"], r["gpath"] = group_of(r)
     ti, to, tr = r["tokens_input"] or 0, r["tokens_output"] or 0, r["tokens_reasoning"] or 0
     c = r["cost"] or 0
     print(B(r["title"]))
-    print(f"{D('会话')}   {r['id']}")
-    loc = f"{proj_label(r)}  {D(r['worktree'] or '?')}"
-    if r["directory"] and r["directory"] != r["worktree"]:
+    print(f"{D('会话')}   {r['key']}")
+    loc = f"{r['glabel']}  {D(r['gpath'])}"
+    if r["tool"] == "oc" and r["directory"] and r["directory"] != r["worktree"]:
         loc += f"   {D('运行于 ' + r['directory'])}"
     print(f"{D('项目')}   {loc}")
-    print(f"{D('模型')}   {model_of(con, r)}")
+    print(f"{D('模型')}   {model_of(con, r) if r['tool'] == 'oc' else (r['model'] or '—')}")
     print(f"{D('活跃')}   {abs_time(r['time_updated'])} {D('(' + rel_time(r['time_updated']) + ')')}"
           f"   {D('创建 ' + abs_time(r['time_created']))}")
     seg = f"{r['msgs']} 条消息 · 输入 {fmt_tok(ti)} tokens · 输出 {fmt_tok(to)} tokens"
@@ -881,11 +1186,16 @@ def show_detail(con, sid):
     if c:
         seg += f" · 费用 ${c:.4f}"
     print(f"{D('统计')}   {seg}")
-    if r["summary_files"]:
+    if r.get("summary_files"):
         print(f"{D('变更')}   +{r['summary_additions'] or 0} -{r['summary_deletions'] or 0}"
               f" · {r['summary_files']} 文件")
-    print_history(con, r["id"])
-    print(f"\n{D('继续: ocs  |  opencode --session ' + r['id'])}")
+    has_reply = (bool(r.get("_reply")) if r["tool"] != "oc" else bool(con.execute(
+        """SELECT 1 FROM message WHERE session_id = ?
+           AND json_extract(data, '$.role') = 'assistant' LIMIT 1""",
+        (r["id"],),
+    ).fetchone()))
+    print_history(r["tool"], r["id"], has_reply)
+    print(f"\n{D('继续: ocs  |  ' + shlex.join(resume_cmd(r['tool'], r['id'], False)))}")
 
 
 def show_group_preview(con, key):
@@ -902,7 +1212,7 @@ def show_group_preview(con, key):
         path = prow["worktree"] or "?"
     else:
         d = key[2:]
-        rows = load_sessions(con, directory=d)  # SQL 里过滤，不必载入全部会话
+        rows = [r for r in load_all() if r["gkey"] == key]  # 目录组可跨工具混排
         label = os.path.basename(d.rstrip("/")) or d
         path = d
     print(B(C("◆ " + label)))
@@ -946,37 +1256,29 @@ def opencode_exe():
     return exe
 
 
-def resume_plan(row, fork):
-    """续接一个会话的公共逻辑：返回 (工作目录, 参数列表)。"""
-    d = ""
-    for cand in (row.get("directory"), row.get("worktree")):
-        if cand and os.path.isdir(cand):
-            d = cand
-            break
-    args = ["opencode", "--session", row["id"]]
-    if fork:
-        args.append("--fork")
-    return d, args
-
-
 def run_resume(row, fork, dry):
-    """启动 opencode 续接会话。dry=True 只打印命令。返回退出码。"""
-    d, args = resume_plan(row, fork)
+    """启动对应 CLI 续接会话。dry=True 只打印命令。返回退出码。"""
+    argv = resume_cmd(row["tool"], row["id"], fork)
+    d = cwd_of(row)
     if dry:
-        print((f"cd {shlex.quote(d)} && " if d else "") + shlex.join(args))
+        print((f"cd {shlex.quote(d)} && " if d else "") + shlex.join(argv))
         return 0
-    exe = opencode_exe()
+    exe = shutil.which(argv[0])
+    if not exe:
+        sys.exit(f"未找到 {argv[0]} 命令：请先安装 {ADAPTERS[row['tool']]['name']} 并加入 PATH")
     t = trunc(row["title"], 50)
-    print(D(f"▸ 继续会话: {t} ({rel_time(row['time_updated'])}) — opencode 退出后回到列表"))
-    return subprocess.run([exe] + args[1:], cwd=d or None).returncode
+    print(D(f"▸ 继续会话: {t} ({rel_time(row['time_updated'])}) — {argv[0]} 退出后回到列表"))
+    return subprocess.run([exe] + argv[1:], cwd=d or None).returncode
 
 
 def delete_sessions(targets):
-    """删除会话列表（每项需含 id/title），已含确认。返回成功数。"""
-    exe = opencode_exe()  # 先确认 opencode 可用，再让用户确认删除
+    """删除会话列表（跨工具：oc 走 CLI，cc/cx 删会话文件），已含确认。返回成功数。"""
+    oc = [r for r in targets if r["tool"] == "oc"]
+    exe = opencode_exe() if oc else None  # 先确认可用性，再让用户确认删除
     print("将删除:")
     for r in targets[:8]:
-        print("  " + trunc(r["title"], 44) + D("  " + r["id"]))
+        loc = r.get("path") or r["id"]
+        print("  " + trunc(r["title"], 44) + D(f"  [{r['tool']}] {loc}"))
     if len(targets) > 8:
         print(D(f"  … 共 {len(targets)} 个"))
     try:
@@ -988,9 +1290,24 @@ def delete_sessions(targets):
         return 0
     ok = 0
     for r in targets:
-        rc = subprocess.run([exe, "session", "delete", r["id"]]).returncode
-        ok += rc == 0
-        print(("✓ 已删除 " if rc == 0 else "✗ 删除失败 ") + r["id"])
+        if r["tool"] == "oc":
+            rc = subprocess.run([exe, "session", "delete", r["id"]]).returncode
+            ok += rc == 0
+            print(("✓ 已删除 " if rc == 0 else "✗ 删除失败 ") + r["id"])
+            continue
+        root = os.path.realpath(os.path.join(
+            cc_root() if r["tool"] == "cc" else cx_root(),
+            "projects" if r["tool"] == "cc" else "sessions"))
+        p = os.path.realpath(r["path"] or "")
+        if not p.startswith(root + os.sep):  # 护栏：只删各工具会话目录里的文件
+            print("✗ 路径不在会话目录内，拒绝删除 " + (p or r["id"]))
+            continue
+        try:
+            os.unlink(p)
+            ok += 1
+            print("✓ 已删除 " + p)
+        except OSError as e:
+            print(f"✗ 删除失败 {r['id']}: {e}")
     return ok
 
 
@@ -1060,21 +1377,22 @@ def rename_session(row):
     row["title"] = new
 
 
-def build_msg_items(con, sid):
+def build_msg_items(con, key):
     """对话视图的列表行：标题行 + 返回行 + 用户提问行（展开状态下附带 AI 回答行）。"""
-    row = find_row(con, sid)
+    row = find_session(key)
     if not row:
         return None
-    r = dict(row)
-    ensure_title(con, r)
+    tool, sid = row["tool"], row["id"]
+    if tool == "oc":
+        ensure_title(con, row)
     st = ui_state()
-    expanded = set(st.get("expanded", [])) if st.get("sid") == sid else set()
+    expanded = set(st.get("expanded", [])) if st.get("key") == key else set()
     items = []
-    items.append((B("◆ " + trunc(r["title"], 60)) + "\t@ses:" + sid + "\t", None))
+    items.append((B("◆ " + trunc(row["title"], 60)) + "\t@ses:" + key + "\t", None))
     items.append((D("← 返回会话列表") + "\t@back\t", None))
-    pairs = message_pairs(con, sid)
+    pairs = pairs_of(tool, sid)
     for i, (q, a) in enumerate(pairs):
-        mid = f"m:{sid}:{i}"
+        mid = f"m:{tool}:{sid}:{i}"
         disp = C("提问│") + trunc(q, 160)
         items.append((disp + "\t" + mid + "\t" + oneline(q + " " + a), None))
         if i in expanded:
@@ -1083,25 +1401,29 @@ def build_msg_items(con, sid):
     return items
 
 
-def build_fzf_items(con, pid):
+def count_all():
+    """轻量会话计数（不解析消息文本）：oc 走 SQL COUNT，cc/cx 数缓存行。"""
+    n = 0
+    if db_path(required=False):
+        n += _oc_con().execute(
+            "SELECT COUNT(*) FROM session WHERE parent_id IS NULL AND time_archived IS NULL"
+        ).fetchone()[0]
+    return n + len(cc_load()) + len(cx_load())
+
+
+def build_fzf_items(con, under):
     """按当前视图构造 fzf 列表行。返回 (items, 会话总数)。"""
     st = ui_state()
-    if st.get("view") == "msg" and st.get("sid"):
-        mitems = build_msg_items(con, st["sid"])
+    if st.get("view") == "msg" and st.get("key"):
+        mitems = build_msg_items(con, st["key"])
         if mitems is not None:
-            total_sql = ("SELECT COUNT(*) FROM session WHERE parent_id IS NULL"
-                         " AND time_archived IS NULL")
-            params = ()
-            if pid:
-                total_sql += " AND project_id = ?"
-                params = (pid,)
-            total = con.execute(total_sql, params).fetchone()[0]
-            return mitems, total  # 只要一个计数，不必把所有会话载入一遍
+            # 只要一个计数，不必把所有会话的消息都载入一遍
+            return mitems, (len(load_all(under)) if under else count_all())
         ui_state_clear()  # 会话没了：回列表
-    rows = load_sessions(con, pid)  # r["search"] 已在其中批量生成
+    rows = load_all(under)  # r["search"] 已在其中生成
     items = []
     tw = row_title_width()
-    if pid is not None:  # -p 指定单项目：不加分组头
+    if under is not None:  # -p 指定目录：不加分组头
         items += [(fzf_line(r, tw), r) for r in rows]
     else:
         groups = {}
@@ -1133,7 +1455,7 @@ _FZF_INFO_CMD = (
 )
 
 
-def picker(con, pid, dry):
+def picker(con, under, dry):
     script = self_cmd()
     try:
         os.unlink(mouse_state_path())  # 新会话从点击模式开始
@@ -1141,18 +1463,17 @@ def picker(con, pid, dry):
         pass
     ui_state_clear()  # 新会话从会话列表开始
     if dry:  # 调试：转储列表行
-        for l, _ in build_fzf_items(con, pid)[0]:
+        for l, _ in build_fzf_items(con, under)[0]:
             print(repr(l))
         return
-    items, nrows = build_fzf_items(con, pid)
+    items, nrows = build_fzf_items(con, under)
     if not items:
         print("（没有会话了）")
         return
-    if pid:
-        prow = con.execute("SELECT name, worktree FROM project WHERE id = ?", (pid,)).fetchone()
-        label = "◆ " + (prow["name"] or proj_label({"pname": None, "worktree": prow["worktree"]})) if prow else "◆ 项目"
+    if under:
+        label = "◆ " + (os.path.basename(under.rstrip("/\\")) or under)
     else:
-        label = "◆ 全部项目"
+        label = "◆ 全部来源"
     copy_hint = (
         "复制: ctrl-y 复制会话 ID · 鼠标按住拖动选中 · 右键「复制」"
         if IS_WIN else
@@ -1168,7 +1489,7 @@ def picker(con, pid, dry):
         + "\n" + D(copy_hint)
     )
     # 所有操作通过 execute 在界面内完成，reload 刷新列表；esc 才退出
-    reload_cmd = script + " --fzf-lines" + (f" --pid {q(pid)}" if pid else "")
+    reload_cmd = script + " --fzf-lines" + (f" --under {q(under)}" if under else "")
     cmd = [
         "fzf", "--ansi", "--layout=reverse", "--multi", "--marker=✓", "--wrap=word", "--track",
         "--delimiter=\t", "--with-nth=1",
@@ -1209,38 +1530,45 @@ def picker(con, pid, dry):
 
 
 def cmd_resume(ids, fork):
-    """续接会话（fzf execute 调用）：在会话目录里启动 opencode。"""
-    sid = ids[0] if ids else ""
-    if not sid:
+    """续接会话（fzf execute 调用）：在会话目录里启动对应 CLI。"""
+    key = ids[0] if ids else ""
+    if not key:
         return
-    if sid.startswith("@ses:"):
-        sid = sid[5:]  # 对话视图的标题行：续接该会话
-    elif sid.startswith("@"):
+    if key.startswith("@ses:"):
+        key = key[5:]  # 对话视图的标题行：续接该会话
+    elif key.startswith("@"):
         return  # 分组/返回行：忽略
-    pm = parse_msg_id(sid)
+    pm = parse_msg_id(key)
     if pm:
-        sid = pm[0]  # 消息行：续接它所属的会话
-    con = connect()
-    row = find_row(con, sid)
+        key = pm[0] + ":" + pm[1]  # 消息行：续接它所属的会话
+    tool, _ = split_key(key)
+    if tool is None:
+        return
+    row = find_session(key)
     if not row:
-        sys.exit(f"找不到会话: {sid}")
-    d, args = resume_plan(dict(row), fork)
-    exe = opencode_exe()
+        sys.exit(f"找不到会话: {key}")
+    if fork and tool != "oc":
+        print(D(f"（{ADAPTERS[tool]['name']} 会话暂不支持分叉，按原会话继续）"))
+        fork = False
+    argv = resume_cmd(tool, row["id"], fork)
+    exe = shutil.which(argv[0])
+    if not exe:
+        sys.exit(f"未找到 {argv[0]} 命令：请先安装 {ADAPTERS[tool]['name']} 并加入 PATH")
+    d = cwd_of(row)
     if IS_WIN:
-        sys.exit(subprocess.run([exe] + args[1:], cwd=d or None).returncode)
+        sys.exit(subprocess.run([exe] + argv[1:], cwd=d or None).returncode)
     if d:
         os.chdir(d)
-    os.execvp(exe, [exe] + args[1:])
+    os.execvp(exe, [exe] + argv[1:])
 
 
-def cmd_copy(sid):
-    if not sid or sid.startswith("@"):
+def cmd_copy(key):
+    if not key or key.startswith("@"):
         return
-    pm = parse_msg_id(sid)
+    pm = parse_msg_id(key)
     if pm:
-        sid = pm[0]  # 消息行：复制所属会话的 ID
-    con = connect()
-    row = find_row(con, sid)
+        key = pm[0] + ":" + pm[1]  # 消息行：复制所属会话的 ID
+    row = find_session(key)
     if row:
         copy_to_clipboard(row["id"])
         if not IS_WIN:
@@ -1248,29 +1576,29 @@ def cmd_copy(sid):
 
 
 def cmd_del(tokens):
-    """删除处理：ses_* 为会话；@ 开头为分组（= 该组全部会话）。"""
-    con = connect()
+    """删除处理：oc:/cc:/cx: 为会话；@ 开头为分组（= 该组全部会话）；其余碎片忽略。"""
     targets = {}
     for t in tokens:
         if t.startswith("@"):
             key = t[1:]
-            for r in load_sessions(con, None):
+            if key.startswith("ses:"):  # 对话视图标题行：不删
+                continue
+            for r in load_all():
                 if r["gkey"] == key:
-                    targets[r["id"]] = r
-        elif t.startswith("ses"):
-            row = find_row(con, t)
+                    targets[r["key"]] = r
+        else:
+            row = find_session(t)  # 无法识别的碎片（路径被空格拆开等）返回 None
             if row:
-                targets[row["id"]] = dict(row)
-        # 其他碎片（路径含空格被拆开等）忽略
+                targets[row["key"]] = row
     if not targets:
         return
     ordered = sorted(targets.values(), key=lambda r: -r["time_updated"])
     delete_sessions(ordered)
 
 
-def cmd_fzf_lines(pid):
-    con = connect()
-    for l, _ in build_fzf_items(con, pid)[0]:
+def cmd_fzf_lines(under):
+    con = _oc_con() if db_path(required=False) else None
+    for l, _ in build_fzf_items(con, under)[0]:
         print(l)
 
 
@@ -1316,7 +1644,7 @@ def main():
     )
     ap.add_argument("-a", "--all", action="store_true",
                     help="（默认即是全部项目分组，此参数为兼容保留）")
-    ap.add_argument("-p", "--project", metavar="DIR", help="只看指定项目目录的会话")
+    ap.add_argument("-p", "--project", metavar="DIR", help="只看指定目录（含其子目录）的会话")
     ap.add_argument("-l", "--list", action="store_true",
                     help="列表模式输出（非交互，适合管道）")
     ap.add_argument("--last", nargs="?", const=1, type=int, metavar="N",
@@ -1338,7 +1666,7 @@ def main():
     ap.add_argument("--rename", metavar="ID", help=argparse.SUPPRESS)
     ap.add_argument("--dels", nargs="+", metavar="TOKEN", help=argparse.SUPPRESS)
     ap.add_argument("--fzf-lines", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--pid", metavar="PROJECT_ID", help=argparse.SUPPRESS)
+    ap.add_argument("--under", metavar="DIR", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     # 鼠标/视图状态类子命令不碰数据库（点击、右键、F8 每次都会走），
@@ -1363,7 +1691,14 @@ def main():
         cmd_click(args.click)
         return
 
-    con = connect()
+    # opencode 没装/没用过时仍可只看 claude code / codex；三家全缺才报错
+    con = None
+    if db_path(required=False):
+        con = connect()
+    elif not (os.path.isdir(os.path.join(cc_root(), "projects"))
+              or os.path.isdir(os.path.join(cx_root(), "sessions"))):
+        sys.exit("找不到任何会话数据：opencode / claude code / codex 都没装或没用过\n"
+                 "（opencode 数据应在 ~/.local/share/opencode/opencode.db）")
 
     if args.show:
         show_detail(con, args.show)
@@ -1378,10 +1713,11 @@ def main():
         return
 
     if args.rename:
-        if not args.rename.startswith("@"):
-            row = find_row(con, args.rename)
-            if row:
-                rename_session(dict(row))
+        row = find_session(args.rename) if split_key(args.rename)[0] else None
+        if row and row["tool"] == "oc":
+            rename_session(row)
+        elif row:
+            print(D(f"（{ADAPTERS[row['tool']]['name']} 会话暂不支持重命名）"))
         return
 
     if args.dels is not None:
@@ -1389,35 +1725,35 @@ def main():
         return
 
     if args.fzf_lines:
-        cmd_fzf_lines(args.pid)
+        cmd_fzf_lines(args.under)
         return
 
     if args.delete:
         targets = []
-        for sid in args.delete:
-            r = find_row(con, sid)
-            if not r:
-                sys.exit(f"找不到会话: {sid}")
-            targets.append(dict(r))
+        for token in args.delete:
+            row = find_session(token if ":" in token else "oc:" + token)
+            if not row:
+                sys.exit(f"找不到会话: {token}")
+            targets.append(row)
         ok = delete_sessions(targets)
         sys.exit(0 if ok == len(targets) else 1)
 
     if args.last is not None:
-        rows = load_sessions(con, None)
+        rows = load_all()
         if len(rows) < args.last:
             sys.exit(f"目前只有 {len(rows)} 个会话，没有第 {args.last} 个")
         sys.exit(run_resume(rows[args.last - 1], fork=args.fork, dry=args.print_cmd))
 
-    pid = resolve_project(con, args.project) if args.project else None
+    under = os.path.abspath(os.path.expanduser(args.project)) if args.project else None
 
     if args.list or not (sys.stdin.isatty() and sys.stdout.isatty()):
-        rows = load_sessions(con, pid)
+        rows = load_all(under)
         if not rows:
             sys.exit("（没有找到任何会话）")
         print_list(rows)
         return
 
-    picker(con, pid, dry=args.print_cmd)
+    picker(con, under, dry=args.print_cmd)
 
 
 if __name__ == "__main__":
