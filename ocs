@@ -67,6 +67,7 @@ from datetime import datetime
 from urllib.request import pathname2url
 
 IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"  # macOS：POSIX 同 Linux，剪贴板 pbcopy、无 /proc
 
 if IS_WIN:  # Windows 控制台默认 GBK，无法编码 •/◆ 等符号，强制 UTF-8
     for _stream in (sys.stdin, sys.stdout, sys.stderr):
@@ -1413,12 +1414,25 @@ def opencode_exe():
     return exe
 
 
-def _ppid_of(pid):
+def _proc_info(pid):
+    """(进程名, 父pid)。Linux 读 /proc；macOS 没有 /proc，用 ps（仅点工具行时调用）。"""
+    if IS_MAC:
+        try:
+            comm = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)],
+                                  capture_output=True, text=True, timeout=2).stdout.strip()
+            ppid = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                                  capture_output=True, text=True, timeout=2).stdout.strip()
+            return os.path.basename(comm or ""), (int(ppid) if ppid.isdigit() else 0)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return "", 0
     try:
+        with open(f"/proc/{pid}/comm") as f:
+            comm = f.read().strip()
         with open(f"/proc/{pid}/stat") as f:
-            return int(f.read().rsplit(")", 1)[1].split()[1])
+            ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        return comm, ppid
     except (OSError, ValueError, IndexError):
-        return 0
+        return "", 0
 
 
 def kill_fzf():
@@ -1430,18 +1444,14 @@ def kill_fzf():
     for _ in range(4):
         if not pid or pid <= 1:
             return
-        try:
-            with open(f"/proc/{pid}/comm") as f:
-                name = f.read().strip()
-        except OSError:
-            return
-        if name == "fzf":
+        name, ppid = _proc_info(pid)
+        if name in ("fzf", "fzf.exe"):
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
             return
-        pid = _ppid_of(pid)
+        pid = ppid
 
 
 def run_resume(row, fork, dry):
@@ -1500,7 +1510,7 @@ def delete_sessions(targets):
 
 
 def copy_to_clipboard(text):
-    """写入系统剪贴板：Windows 用 clip；Linux 用 wl-copy → xclip/xsel → OSC 52。"""
+    """写入系统剪贴板：Windows 用 clip；macOS 用 pbcopy；Linux 用 wl-copy → xclip/xsel → OSC 52。"""
     if IS_WIN:
         try:
             p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=False)
@@ -1511,6 +1521,12 @@ def copy_to_clipboard(text):
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command", "Set-Clipboard"],
                            input=text, text=True, capture_output=True, timeout=10)
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    if IS_MAC:
+        try:  # pbcopy 读完 stdin 即退出，可直接等它
+            subprocess.run(["pbcopy"], input=text.encode(), timeout=5, check=False)
             return True
         except (OSError, subprocess.TimeoutExpired):
             return False
